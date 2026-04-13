@@ -1,0 +1,37 @@
+[project]
+name = "alpasim_student"
+version = "0.1.0"
+description = "Student model plugin for closed-loop DAgger training with Alpamayo 1.5"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "alpasim_plugins",
+    "alpasim_driver",
+    "alpasim_grpc",
+    "alpasim_utils",
+    "numpy",
+    "torch",
+    "torchvision",
+    "pandas",
+    "pyarrow",
+    "wandb",
+    "omegaconf",
+]
+
+[project.entry-points."alpasim.models"]
+student = "alpasim_student.student_model:StudentModel"
+
+[project.entry-points."alpasim.configs"]
+student = "alpasim_student.configs"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["alpasim_student"]
+
+[tool.uv.sources]
+alpasim_plugins = { workspace = true }
+alpasim_driver  = { workspace = true }
+alpasim_grpc    = { workspace = true }
+alpasim_utils   = { workspace = true }

@@ -1,0 +1,55 @@
+# @package _global_
+# 2-GPU topology tuned for Alpamayo 1.5 (10B, ~20 GB bfloat16).
+#
+# GPU 0 → 1 driver replica (Alpamayo fits in ~20 GB; 3 replicas would OOM on 32 GB)
+# GPU 1 → sensorsim / NRE neural renderer
+#
+# Throughput: 1 x 1 x 4 = 4 concurrent rollouts (driver is the bottleneck)
+
+defines:
+  nre_cache_size: 5  # sensorsim.n_concurrent_rollouts + 1
+
+services:
+  sensorsim:
+    environments:
+      - OMP_NUM_THREADS=1
+    replicas_per_container: 1
+    gpus: [1]
+
+  driver:
+    replicas_per_container: 1   # Alpamayo 1.5 ~20 GB — only 1 fits on a 32 GB GPU
+    gpus: [0]
+
+  physics:
+    replicas_per_container: 1
+    gpus: [0, 1]
+
+  trafficsim:
+    replicas_per_container: 1
+    gpus: [0, 1]
+
+  controller:
+    replicas_per_container: 4
+    gpus: null
+
+runtime:
+  nr_workers: 2
+  endpoints:
+    # SENS: 1 x 1 x 4 = 4
+    # DRIV: 1 x 1 x 4 = 4
+    # PHYS: 2 x 1 x 2 = 4
+    # CONT: 1 (CPU) x 4 x 1 = 4
+    sensorsim:
+      n_concurrent_rollouts: 4
+    driver:
+      n_concurrent_rollouts: 4
+      skip: false
+    physics:
+      n_concurrent_rollouts: 2
+      skip: false
+    controller:
+      n_concurrent_rollouts: 1
+      skip: false
+    trafficsim:
+      n_concurrent_rollouts: 1
+      skip: true

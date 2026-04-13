@@ -1,0 +1,35 @@
+# @package _global_
+# 4-camera simulation spec for the student driver.
+# Mirrors alpamayo_configs.yaml from src/wizard/configs/driver/ so that the
+# rollout spec includes cross cameras (required by StudentNet).
+
+defaults:
+  - _self_
+
+runtime:
+  simulation_config:
+    cameras:
+      - logical_id: camera_front_wide_120fov
+        height: 1080
+        width: 1900
+        frame_interval_us: 100000
+        shutter_duration_us: 30000
+        first_frame_offset_us: -30000
+      - logical_id: camera_front_tele_30fov
+        height: 1080
+        width: 1900
+        frame_interval_us: 100000
+        shutter_duration_us: 30000
+        first_frame_offset_us: -30000
+      - logical_id: camera_cross_left_120fov
+        height: 1080
+        width: 1900
+        frame_interval_us: 100000
+        shutter_duration_us: 30000
+        first_frame_offset_us: -30000
+      - logical_id: camera_cross_right_120fov
+        height: 1080
+        width: 1900
+        frame_interval_us: 100000
+        shutter_duration_us: 30000
+        first_frame_offset_us: -30000
