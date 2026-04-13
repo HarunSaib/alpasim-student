@@ -20,7 +20,7 @@ import pandas as pd
 ALPASIM_ROOT = Path(__file__).resolve().parents[4]  # ~/alpasim
 
 
-def _run_wizard(driver: str, log_dir: Path, topology: str = "2gpu_alpamayo") -> None:
+def _run_wizard(driver: str, log_dir: Path, topology: str = "2gpu_alpamayo", base_dir: Path | None = None) -> None:
     """Launch alpasim_wizard, patch docker-compose for the student plugin, then run it.
 
     Steps:
@@ -91,7 +91,7 @@ def _run_wizard(driver: str, log_dir: Path, topology: str = "2gpu_alpamayo") -> 
             # Add plugins + checkpoints volume mounts if not present
             drivers_mount = "      - /home/harun/alpasim/data/drivers:/mnt/drivers"
             plugins_mount = f"\n      - {plugins_host}:/repo/plugins"
-            ckpt_host = str(ALPASIM_ROOT / "dagger_run" / "checkpoints")
+            ckpt_host = str((base_dir or ALPASIM_ROOT / "dagger_run").resolve() / "checkpoints")
             ckpt_mount = f"\n      - {ckpt_host}:/mnt/checkpoints"
             # Add plugins mount only if not already present
             if "/repo/plugins" not in driver_block and drivers_mount in driver_block:
@@ -317,7 +317,7 @@ def run_dagger(
         if iteration == 0 or student_ckpt is None:
             print("\n[loop] Phase 1: bootstrapping with Alpamayo 1.5 teacher...")
             teacher_run = iter_dir / "teacher_run"
-            _run_wizard("alpamayo1_5", teacher_run)
+            _run_wizard("alpamayo1_5", teacher_run, base_dir=base_dir)
             _loop_log(_build_eval_log(teacher_run, iteration, "teacher"))
             source_run = teacher_run
 
@@ -328,7 +328,7 @@ def run_dagger(
             # Update student.yaml checkpoint path before launching
             _patch_student_checkpoint(student_ckpt)
             # Use 2gpu_alpamayo topology (has all required config fields)
-            _run_wizard("student", student_run, topology="2gpu_alpamayo")
+            _run_wizard("student", student_run, topology="2gpu_alpamayo", base_dir=base_dir)
 
             # Log student eval metrics to W&B
             _loop_log(_build_eval_log(student_run, iteration, "student"))
@@ -353,7 +353,7 @@ def run_dagger(
 
             print("[loop] Phase 1b: querying teacher for corrections on failed scenes...")
             correction_run = iter_dir / "teacher_correction_run"
-            _run_wizard("alpamayo1_5", correction_run)
+            _run_wizard("alpamayo1_5", correction_run, base_dir=base_dir)
             _loop_log(_build_eval_log(correction_run, iteration, "teacher_correction"))
             source_run = correction_run
 
