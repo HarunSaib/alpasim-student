@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -18,6 +19,23 @@ from pathlib import Path
 import pandas as pd
 
 ALPASIM_ROOT = Path(__file__).resolve().parents[4]  # ~/alpasim
+
+
+def _load_env() -> None:
+    """Load .env from the alpasim root into os.environ (if not already set)."""
+    env_file = ALPASIM_ROOT / ".env"
+    if not env_file.exists():
+        return
+    for line in env_file.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key and value and key not in os.environ:
+            os.environ[key] = value
+            print(f"[env] Loaded {key} from .env")
 
 
 def _run_wizard(driver: str, log_dir: Path, topology: str = "2gpu_alpamayo", base_dir: Path | None = None) -> None:
@@ -29,7 +47,6 @@ def _run_wizard(driver: str, log_dir: Path, topology: str = "2gpu_alpamayo", bas
            command so the student plugin entry-point is visible inside the container.
         3. Run ``docker compose up`` manually to start services.
     """
-    import os
     import re
 
     log_dir = Path(log_dir).resolve()
@@ -250,8 +267,9 @@ def run_dagger(
     start_iteration: int = 0,
     initial_checkpoint: Path | None = None,
 ) -> None:
-    import os
     import wandb
+
+    _load_env()
 
     from .collector import collect_from_run
     from .trainer import train
