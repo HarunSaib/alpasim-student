@@ -156,6 +156,7 @@ def train(
     dagger_iter: int = 0,
 ):
     device = torch.device(device_str)
+    checkpoint_out = Path(checkpoint_out).resolve()
 
     wandb_mode = "online" if os.environ.get("WANDB_API_KEY") else "disabled"
 
