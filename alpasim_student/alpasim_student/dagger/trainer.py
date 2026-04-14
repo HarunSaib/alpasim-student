@@ -178,6 +178,7 @@ def train(
         project="alpasim-student",
         name=f"dagger_iter_{dagger_iter}",
         mode=wandb_mode,
+        settings=wandb.Settings(_disable_stats=True, _disable_meta=True),
         config={
             "num_epochs":        num_epochs,
             "batch_size":        batch_size,

@@ -285,6 +285,7 @@ def run_dagger(
         project="alpasim-dagger-loop",
         name=f"dagger_loop_start{start_iteration}",
         mode=wandb_mode,
+        settings=wandb.Settings(_disable_stats=True, _disable_meta=True),
         config={
             "n_iterations":    n_iterations,
             "epochs_per_iter": epochs_per_iter,
