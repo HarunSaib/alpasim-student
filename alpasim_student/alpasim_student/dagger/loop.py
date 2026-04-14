@@ -395,7 +395,7 @@ def run_dagger(
             data_dirs      = all_data_dirs,
             checkpoint_out = ckpt_out,
             num_epochs     = epochs_per_iter,
-            device_str     = "cuda:0",
+            device_str     = "cuda:1",
             resume_from    = str(student_ckpt) if student_ckpt else None,
             dagger_iter    = iteration + 1,
         )
