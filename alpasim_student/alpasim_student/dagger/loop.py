@@ -295,6 +295,9 @@ def run_dagger(
     )
     loop_run_id = loop_run.id if loop_run and wandb_mode == "online" else None
 
+    # Pre-create checkpoints dir as harun so Docker (root) can't steal ownership
+    (base_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+
     def _loop_log(data: dict) -> None:
         """Log to W&B, reinitialising the loop run if train() closed it."""
         if wandb_mode != "online":
