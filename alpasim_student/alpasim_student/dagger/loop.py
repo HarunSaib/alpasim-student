@@ -199,9 +199,10 @@ def _detect_failures(
         dist_to_gt_trajectory   > threshold (metres, default 5.0)
     """
     thresholds = thresholds or {
-        "collision_any":          0.0,
-        "offroad":                0.0,
-        "dist_to_gt_trajectory":  5.0,
+        "collision_any": 0.0,
+        "offroad":       0.0,
+        # dist_to_gt_trajectory omitted: it flagged clean rollouts that took a
+        # slightly different valid path, causing unnecessary teacher corrections.
     }
     failed: list[str] = []
     for metrics_file in sorted(run_dir.glob("rollouts/*/*/metrics.parquet")):
@@ -394,6 +395,7 @@ def run_dagger(
         # Step 3  Train student on all data collected so far (dataset agg.)   #
         # ------------------------------------------------------------------ #
         ckpt_out = base_dir / "checkpoints" / f"student_iter_{iteration + 1}.pth"
+        best_ckpt_out = base_dir / "checkpoints" / f"student_iter_{iteration + 1}_best.pth"
         print(f"\n[loop] Phase 3: training student ({len(all_data_dirs)} dataset(s))...")
         train(
             data_dirs      = all_data_dirs,
@@ -404,7 +406,8 @@ def run_dagger(
             dagger_iter    = iteration + 1,
         )
         # train() calls wandb.finish() — _loop_log will reinit the run if needed
-        student_ckpt = ckpt_out
+        # Prefer the best-val-ADE checkpoint for the next simulation run.
+        student_ckpt = best_ckpt_out if best_ckpt_out.exists() else ckpt_out
         print(f"[loop] Student checkpoint: {student_ckpt}")
 
         _loop_log({

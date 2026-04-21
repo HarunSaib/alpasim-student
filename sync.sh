@@ -25,4 +25,5 @@ cp "$STUDENT_REPO/topology/2gpu_alpamayo.yaml" \
 echo "[sync] Done. You can now run:"
 echo "  cd $ALPASIM_ROOT"
 echo "  uv run --extra all --no-sync python -m alpasim_student.dagger.loop \\"
-echo "      --base-dir ./dagger_run_v3 --iterations 7 --epochs 30"
+echo "      --base-dir ./dagger_run --start-iteration 15 --iterations 30 --epochs 50 \\"
+echo "      --initial-checkpoint ./dagger_run/checkpoints/student_iter_15_best.pth"

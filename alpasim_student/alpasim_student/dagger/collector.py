@@ -30,6 +30,14 @@ from PIL import Image
 from alpasim_utils.logs import async_read_pb_log
 
 
+def _lookup_speed(speed_buffer: dict[int, float], ts: int) -> float:
+    """Return speed at ts by finding the nearest key in speed_buffer."""
+    if not speed_buffer:
+        return 0.0
+    closest = min(speed_buffer.keys(), key=lambda t: abs(t - ts))
+    return speed_buffer[closest]
+
+
 async def _extract_rollout(asl_path: Path, out_dir: Path) -> int:
     """Parse one .asl file and write samples to out_dir.  Returns sample count."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -42,6 +50,9 @@ async def _extract_rollout(asl_path: Path, out_dir: Path) -> int:
     # Images selected for the current driver step
     pending_images: dict[str, np.ndarray] = {}
     current_ts: int = 0
+
+    # speed_buffer[timestamp_us] = speed_m_s from ego dynamic states
+    speed_buffer: dict[int, float] = {}
 
     async for entry in async_read_pb_log(str(asl_path)):
         kind = entry.WhichOneof("log_entry")
@@ -56,6 +67,17 @@ async def _extract_rollout(asl_path: Path, out_dir: Path) -> int:
             if ts not in image_buffer:
                 image_buffer[ts] = {}
             image_buffer[ts][cam_id] = bytes(ci.image_bytes)
+
+        # ------------------------------------------------------------------ #
+        # Ego dynamic states: extract speed at each pose timestamp            #
+        # ------------------------------------------------------------------ #
+        elif kind == "driver_ego_trajectory":
+            ego_traj = entry.driver_ego_trajectory
+            for pose, dyn in zip(ego_traj.trajectory.poses, ego_traj.dynamic_states):
+                ts = int(pose.timestamp_us)
+                vx = dyn.linear_velocity.x
+                vy = dyn.linear_velocity.y
+                speed_buffer[ts] = float((vx ** 2 + vy ** 2) ** 0.5)
 
         # ------------------------------------------------------------------ #
         # driver_request marks the start of a new decision step               #
@@ -99,7 +121,7 @@ async def _extract_rollout(asl_path: Path, out_dir: Path) -> int:
             records.append({
                 "timestamp_us": current_ts,
                 "traj_xy":      traj_xy,
-                "speed":        0.0,          # speed not in driver_return; use 0
+                "speed":        _lookup_speed(speed_buffer, current_ts),
                 "img_file":     str(img_file),
             })
 
