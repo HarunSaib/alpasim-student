@@ -286,6 +286,7 @@ def run_dagger(
     start_iteration: int = 0,
     initial_checkpoint: Path | None = None,
     scene_ids: list[str] | None = None,
+    teacher_scene_ids: list[str] | None = None,
 ) -> None:
     import wandb
 
@@ -359,7 +360,7 @@ def run_dagger(
         if iteration == 0 or student_ckpt is None:
             print("\n[loop] Phase 1: bootstrapping with Alpamayo 1.5 teacher...")
             teacher_run = iter_dir / "teacher_run"
-            _run_wizard("alpamayo1_5", teacher_run, base_dir=base_dir, scene_ids=scene_ids)
+            _run_wizard("alpamayo1_5", teacher_run, base_dir=base_dir, scene_ids=teacher_scene_ids)
             _loop_log(_build_eval_log(teacher_run, iteration, "teacher"))
             source_run = teacher_run
 
@@ -395,7 +396,7 @@ def run_dagger(
 
             print("[loop] Phase 1b: querying teacher for corrections on failed scenes...")
             correction_run = iter_dir / "teacher_correction_run"
-            _run_wizard("alpamayo1_5", correction_run, base_dir=base_dir, scene_ids=scene_ids)
+            _run_wizard("alpamayo1_5", correction_run, base_dir=base_dir, scene_ids=teacher_scene_ids)
             _loop_log(_build_eval_log(correction_run, iteration, "teacher_correction"))
             source_run = correction_run
 
@@ -484,4 +485,5 @@ if __name__ == "__main__":
         start_iteration     = args.start_iteration,
         initial_checkpoint  = Path(args.initial_checkpoint) if args.initial_checkpoint else None,
         scene_ids           = args.scenes or DEFAULT_SCENE_IDS,
+        teacher_scene_ids   = [DEFAULT_SCENE_IDS[0]],
     )
