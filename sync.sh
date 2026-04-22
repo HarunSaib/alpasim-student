@@ -24,7 +24,7 @@ cp "$STUDENT_REPO/topology/2gpu_alpamayo.yaml" \
 
 echo "[sync] Installing alpasim_student into venv..."
 cd "$ALPASIM_ROOT"
-uv pip install -e plugins/alpasim_student --no-deps --quiet
+uv pip install -e plugins/alpasim_student --quiet
 
 echo "[sync] Done. You can now run:"
 echo "  cd $ALPASIM_ROOT"
