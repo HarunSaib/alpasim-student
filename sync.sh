@@ -22,6 +22,10 @@ echo "[sync] Copying topology config..."
 cp "$STUDENT_REPO/topology/2gpu_alpamayo.yaml" \
    "$ALPASIM_ROOT/src/wizard/configs/topology/2gpu_alpamayo.yaml"
 
+echo "[sync] Installing alpasim_student into venv..."
+cd "$ALPASIM_ROOT"
+uv pip install -e plugins/alpasim_student --no-deps --quiet
+
 echo "[sync] Done. You can now run:"
 echo "  cd $ALPASIM_ROOT"
 echo "  uv run --extra all --no-sync python -m alpasim_student.dagger.loop \\"
