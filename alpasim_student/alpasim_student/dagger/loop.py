@@ -272,6 +272,13 @@ def _build_eval_log(run_dir: Path, iteration: int, phase: str) -> dict:
     return log
 
 
+DEFAULT_SCENE_IDS = [
+    "clipgt-01d503d4-449b-46fc-8d78-9085e70d3554",
+    "clipgt-a309e228-26e1-423e-a44c-cb00aa7378cb",
+    "clipgt-804afc4a-fd1e-4f58-bd39-a4c486a916e5",
+]
+
+
 def run_dagger(
     base_dir: Path,
     n_iterations: int = 5,
@@ -476,5 +483,5 @@ if __name__ == "__main__":
         epochs_per_iter     = args.epochs,
         start_iteration     = args.start_iteration,
         initial_checkpoint  = Path(args.initial_checkpoint) if args.initial_checkpoint else None,
-        scene_ids           = args.scenes,
+        scene_ids           = args.scenes or DEFAULT_SCENE_IDS,
     )
