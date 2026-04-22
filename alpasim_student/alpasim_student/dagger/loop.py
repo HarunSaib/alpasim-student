@@ -63,7 +63,7 @@ def _run_wizard(
         "uv", "run",
         "--extra", "all",
         "--no-sync",
-        "alpasim_wizard",
+        "python", "-m", "alpasim_wizard",
         "deploy=local",
         "wizard.run_method=NONE",   # generate docker-compose.yaml without running it
         f"topology={topology}",
