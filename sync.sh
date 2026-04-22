@@ -11,8 +11,9 @@ set -e
 STUDENT_REPO="/home/harun/alpasim-student"
 ALPASIM_ROOT="/home/harun/alpasim"
 
-echo "[sync] Pulling latest from GitHub..."
+echo "[sync] Pushing and pulling from GitHub..."
 cd "$STUDENT_REPO"
+git push
 git pull
 
 echo "[sync] Copying plugin into alpasim..."
