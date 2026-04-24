@@ -210,10 +210,9 @@ def _detect_failures(
         dist_to_gt_trajectory   > threshold (metres, default 5.0)
     """
     thresholds = thresholds or {
-        "collision_any": 0.0,
-        "offroad":       0.0,
-        # dist_to_gt_trajectory omitted: it flagged clean rollouts that took a
-        # slightly different valid path, causing unnecessary teacher corrections.
+        "collision_any":  0.0,
+        "offroad":        0.0,
+        "plan_deviation": 0.8,  # catches near-misses before full offroad event
     }
     failed: list[str] = []
     for metrics_file in sorted(run_dir.glob("rollouts/*/*/metrics.parquet")):
@@ -272,11 +271,34 @@ def _build_eval_log(run_dir: Path, iteration: int, phase: str) -> dict:
     return log
 
 
-DEFAULT_SCENE_IDS = [
+# All available scenes ordered from simplest to most varied.
+ALL_SCENE_IDS = [
     "clipgt-01d503d4-449b-46fc-8d78-9085e70d3554",
     "clipgt-a309e228-26e1-423e-a44c-cb00aa7378cb",
     "clipgt-804afc4a-fd1e-4f58-bd39-a4c486a916e5",
+    "clipgt-5b9f1c2a-8e3d-4a7f-b6c5-1d2e3f4a5b6c",
+    "clipgt-7c8d9e0f-1a2b-3c4d-5e6f-7a8b9c0d1e2f",
 ]
+
+DEFAULT_SCENE_IDS = ALL_SCENE_IDS[:3]
+
+# Curriculum: scene list expands as the model matures.
+# Iters 0-5: 2 scenes (basic lane keeping), 6-15: 3 scenes (turns), 16+: 5 scenes (full diversity).
+CURRICULUM = [
+    (0,  ALL_SCENE_IDS[:2]),   # iters 0–5
+    (6,  ALL_SCENE_IDS[:3]),   # iters 6–15
+    (16, ALL_SCENE_IDS),       # iters 16+
+]
+
+
+def _curriculum_scenes(iteration: int, scene_ids: list[str]) -> list[str]:
+    """Return the scene list for this iteration based on the curriculum schedule."""
+    active = scene_ids
+    for threshold, scenes in CURRICULUM:
+        if iteration >= threshold:
+            # Map curriculum indices onto the caller-supplied scene list
+            active = scene_ids[:len(scenes)]
+    return active
 
 
 def run_dagger(
@@ -357,10 +379,15 @@ def run_dagger(
         # ------------------------------------------------------------------ #
         # Step 1  Run teacher (iteration 0) or student + collect corrections  #
         # ------------------------------------------------------------------ #
+        iter_scene_ids         = _curriculum_scenes(iteration, scene_ids)
+        iter_teacher_scene_ids = _curriculum_scenes(iteration, teacher_scene_ids)
+        print(f"[loop] Curriculum: {len(iter_scene_ids)} student scenes, "
+              f"{len(iter_teacher_scene_ids)} teacher scenes (iter {iteration})")
+
         if iteration == 0 or student_ckpt is None:
             print("\n[loop] Phase 1: bootstrapping with Alpamayo 1.5 teacher...")
             teacher_run = iter_dir / "teacher_run"
-            _run_wizard("alpamayo1_5", teacher_run, base_dir=base_dir, scene_ids=teacher_scene_ids)
+            _run_wizard("alpamayo1_5", teacher_run, base_dir=base_dir, scene_ids=iter_teacher_scene_ids)
             _loop_log(_build_eval_log(teacher_run, iteration, "teacher"))
             source_run = teacher_run
 
@@ -371,7 +398,7 @@ def run_dagger(
             # Update student.yaml checkpoint path before launching
             _patch_student_checkpoint(student_ckpt)
             # Use 2gpu_alpamayo topology (has all required config fields)
-            _run_wizard("student", student_run, topology="2gpu_alpamayo", base_dir=base_dir, scene_ids=scene_ids)
+            _run_wizard("student", student_run, topology="2gpu_alpamayo", base_dir=base_dir, scene_ids=iter_scene_ids)
 
             # Log student eval metrics to W&B
             _loop_log(_build_eval_log(student_run, iteration, "student"))
@@ -396,7 +423,7 @@ def run_dagger(
 
             print("[loop] Phase 1b: querying teacher for corrections on failed scenes...")
             correction_run = iter_dir / "teacher_correction_run"
-            _run_wizard("alpamayo1_5", correction_run, base_dir=base_dir, scene_ids=teacher_scene_ids)
+            _run_wizard("alpamayo1_5", correction_run, base_dir=base_dir, scene_ids=iter_teacher_scene_ids)
             _loop_log(_build_eval_log(correction_run, iteration, "teacher_correction"))
             source_run = correction_run
 
@@ -485,5 +512,5 @@ if __name__ == "__main__":
         start_iteration     = args.start_iteration,
         initial_checkpoint  = Path(args.initial_checkpoint) if args.initial_checkpoint else None,
         scene_ids           = args.scenes or DEFAULT_SCENE_IDS,
-        teacher_scene_ids   = [DEFAULT_SCENE_IDS[0]],
+        teacher_scene_ids   = DEFAULT_SCENE_IDS[:2],
     )

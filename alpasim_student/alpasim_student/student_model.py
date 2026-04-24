@@ -52,7 +52,7 @@ class StudentNet(nn.Module):
 
     IMG_H = 224
     IMG_W = 224
-    NUM_WAYPOINTS = 10   # 10 Hz × 1 s horizon, matches Alpamayo 1.5
+    NUM_WAYPOINTS = 25   # 10 Hz × 2.5 s horizon
     STATE_DIM = 2        # speed (m/s), acceleration (m/s²)
 
     def __init__(self, num_cameras: int = 4):
