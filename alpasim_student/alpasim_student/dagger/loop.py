@@ -362,6 +362,8 @@ def run_dagger(
         """Re-open the loop-level W&B run after train() closed it."""
         _loop_log({})  # no-op log just to ensure run is open
 
+    pass_rate_history: list[float] = []
+
     # Seed all_data_dirs from already-collected datasets for iterations before start_iteration.
     for i in range(start_iteration):
         candidate = base_dir / f"iter_{i}" / "dataset"
@@ -420,6 +422,16 @@ def run_dagger(
                     print("[loop] Student passed all scenarios — training complete.")
                     _loop_log({"dagger/converged": True})
                     return
+
+                # Stagnation check: stop if pass rate hasn't improved by >2%
+                # over the last 4 iterations — model has plateaued.
+                pass_rate_history.append(pass_rate)
+                if len(pass_rate_history) >= 4:
+                    recent_improvement = max(pass_rate_history[-4:]) - min(pass_rate_history[-4:])
+                    if recent_improvement < 0.02:
+                        print(f"[loop] Pass rate stagnated (Δ={recent_improvement:.1%} over 4 iters) — stopping early.")
+                        _loop_log({"dagger/stagnated": True})
+                        return
 
             print("[loop] Phase 1b: querying teacher for corrections on failed scenes...")
             correction_run = iter_dir / "teacher_correction_run"
@@ -493,8 +505,8 @@ def _patch_student_checkpoint(ckpt_path: Path) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-dir",           default="./dagger_run")
-    parser.add_argument("--iterations",         type=int,   default=5)
-    parser.add_argument("--epochs",             type=int,   default=30)
+    parser.add_argument("--iterations",         type=int,   default=20)
+    parser.add_argument("--epochs",             type=int,   default=60)
     parser.add_argument("--start-iteration",    type=int,   default=0,
                         help="Resume DAgger from this iteration index (0-based).")
     parser.add_argument("--initial-checkpoint", default=None,
