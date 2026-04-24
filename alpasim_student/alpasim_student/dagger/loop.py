@@ -273,11 +273,11 @@ def _build_eval_log(run_dir: Path, iteration: int, phase: str) -> dict:
 
 # All available scenes ordered from simplest to most varied.
 ALL_SCENE_IDS = [
-    "clipgt-01d503d4-449b-46fc-8d78-9085e70d3554",
-    "clipgt-a309e228-26e1-423e-a44c-cb00aa7378cb",
-    "clipgt-804afc4a-fd1e-4f58-bd39-a4c486a916e5",
-    "clipgt-5b9f1c2a-8e3d-4a7f-b6c5-1d2e3f4a5b6c",
-    "clipgt-7c8d9e0f-1a2b-3c4d-5e6f-7a8b9c0d1e2f",
+    "clipgt-01d503d4-449b-46fc-8d78-9085e70d3554",   # Batch0005 — default, straightforward
+    "clipgt-a309e228-26e1-423e-a44c-cb00aa7378cb",   # Batch0005 — turning scene (was failing)
+    "clipgt-804afc4a-fd1e-4f58-bd39-a4c486a916e5",   # Batch0005 — mixed
+    "clipgt-1bccdc21-6e9c-425a-a0a1-392e2353f2b3",   # Batch0002 — different lighting/geometry
+    "clipgt-6e190b33-73c2-4958-8448-db999b871a78",   # Batch0010 — maximum diversity
 ]
 
 DEFAULT_SCENE_IDS = ALL_SCENE_IDS[:3]
