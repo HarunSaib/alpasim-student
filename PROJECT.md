@@ -30,7 +30,8 @@ Windows Machine  ──git push──►  GitHub (HarunSaib/alpasim-student)
 ```
 alpasim-student/                   ← This repo (your code only)
 │
-├── sync.sh                        ← Pull from GitHub + copy into alpasim
+├── sync.sh                        ← Push to GitHub + copy into alpasim + uv sync
+├── README.md                      ← Quick-start guide
 ├── PROJECT.md                     ← This file
 │
 ├── alpasim_student/               ← Python plugin package
@@ -69,7 +70,7 @@ loop.py
   │
   ├─ Iteration 0 (Bootstrap)
   │     │
-  │     ├─► _run_wizard("alpamayo1_5")
+  │     ├─► _run_wizard("alpamayo1_5")   [2 scenes: 01d503d4 + a309e228]
   │     │        AlpaSim spins up Docker containers:
   │     │          runtime   ← physics engine, clock, events
   │     │          sensorsim ← renders camera frames (4 cameras)
@@ -78,34 +79,45 @@ loop.py
   │     │        Output: rollouts/*/rollout.asl  (protobuf log)
   │     │
   │     ├─► collector.py: collect_from_run()
-  │     │        Reads rollout.asl → extracts (camera images, teacher trajectory)
+  │     │        Reads rollout.asl → extracts (camera images, speed, teacher trajectory)
+  │     │        Speed read from driver_ego_trajectory.dynamic_states (not hardcoded)
   │     │        Output: iter_0/dataset/*/samples.parquet + step_*_imgs.npz
   │     │
   │     └─► trainer.py: train()
-  │              Loads all datasets, trains StudentNet
-  │              Output: checkpoints/student_iter_1.pth
+  │              Loads all datasets, trains StudentNet with weighted sampling
+  │              Output: checkpoints/student_iter_1.pth + student_iter_1_best.pth
   │
   └─ Iterations 1–N (DAgger)
         │
-        ├─► _run_wizard("student")
-        │        Same Docker setup but driver-0 runs StudentNet instead
-        │        Reads checkpoint from /mnt/checkpoints/ (Docker volume mount)
+        ├─► _curriculum_scenes()
+        │        Expands scene list based on iteration:
+        │          iters 0–5:  2 scenes  (basic lane keeping)
+        │          iters 6–15: 3 scenes  (turns introduced)
+        │          iters 16+:  5 scenes  (full diversity)
+        │
+        ├─► _run_wizard("student")   [curriculum student scenes]
+        │        driver-0 runs StudentNet from /mnt/checkpoints/student_iter_N_best.pth
         │        Output: rollouts/*/rollout.asl + metrics.parquet
         │
         ├─► _detect_failures()
-        │        Reads metrics.parquet (long-format: name/values/time_aggregation)
-        │        Flags rollouts where collision_any > 0 or offroad > 0
-        │        If ALL pass → training converged, loop exits early
+        │        Reads metrics.parquet, flags rollouts where:
+        │          collision_any > 0
+        │          offroad > 0
+        │          plan_deviation > 2.5  (near-miss threshold)
+        │        If ALL pass → training converged, loop exits
+        │        Stagnation check: exits if pass rate improves < 2% over 4 iters
+        │                          (only activates after first non-zero pass rate)
         │
-        ├─► _run_wizard("alpamayo1_5")   [only on failed rollouts]
-        │        Teacher re-drives the SAME scene to demonstrate correct behaviour
+        ├─► _run_wizard("alpamayo1_5")   [curriculum teacher scenes, failed only]
+        │        Teacher re-drives failed scenes to demonstrate correct behaviour
         │
         ├─► collector.py: collect_from_run()
         │        Collects teacher corrections as new training data
         │
         └─► trainer.py: train()
                  Trains on ALL data collected so far (dataset aggregation)
-                 Output: checkpoints/student_iter_N.pth
+                 Recent iterations weighted 2× older ones (WeightedRandomSampler)
+                 Output: checkpoints/student_iter_N.pth + student_iter_N_best.pth
 ```
 
 ---
@@ -115,31 +127,42 @@ loop.py
 ### `dagger/loop.py`
 The top-level orchestrator. Runs as:
 ```bash
-uv run python -m alpasim_student.dagger.loop --base-dir ./dagger_run --iterations 7 --epochs 30
+uv run --extra all --no-sync python -m alpasim_student.dagger.loop \
+    --base-dir ./dagger_run_v2 \
+    --iterations 20 \
+    --epochs 60
 ```
 Key functions:
 - `run_dagger()` — main loop, calls all other components
 - `_run_wizard()` — generates docker-compose.yaml via alpasim_wizard, patches it to add volume mounts, then runs `docker compose up`
-- `patch_driver_block()` — injects `/mnt/checkpoints` and `/repo/plugins` volume mounts into the driver container so it can find the student checkpoint and plugin code
-- `_detect_failures()` — reads `metrics.parquet` to find which rollouts had collisions or offroad events
+- `_curriculum_scenes()` — returns the scene list for the current iteration based on CURRICULUM schedule
+- `_detect_failures()` — reads `metrics.parquet` to find rollouts with collisions, offroad events, or high plan deviation (> 2.5)
 - `_pivot_metrics()` — converts AlpaSim's long-format parquet (rows of name/value pairs) into a flat `{metric_name: value}` dict
-- `_patch_student_checkpoint()` — updates `student.yaml` with the latest checkpoint path before each student run
-- `_build_eval_log()` — collects per-rollout metrics into a summary dict for logging
+- `_patch_student_checkpoint()` — updates `student.yaml` with the latest `_best.pth` checkpoint path before each student run
+- `_build_eval_log()` — collects per-rollout metrics into a summary dict for W&B logging
+
+Key constants:
+- `ALL_SCENE_IDS` — 5 scenes from HuggingFace `nvidia/PhysicalAI-Autonomous-Vehicles-NuRec` (Batch0002, Batch0005 ×3, Batch0010)
+- `CURRICULUM` — maps iteration thresholds to scene counts: `[(0, 2 scenes), (6, 3 scenes), (16, 5 scenes)]`
 
 ### `dagger/trainer.py`
 Trains StudentNet on collected datasets. Key details:
-- **Optimizer**: AdamW (weight_decay=1e-4) — better regularisation than plain Adam
+- **Optimizer**: AdamW (weight_decay=1e-4)
 - **Scheduler**: OneCycleLR — warmup for 10% of training, then cosine decay
-- **Loss**: MSE on (x, y) trajectory waypoints
+- **Loss**: MSE on (x, y) trajectory waypoints across all 25 waypoints
+- **Sampler**: WeightedRandomSampler — recent iterations weighted up to 2× older ones
 - **Validation**: 10% random split, saves best checkpoint by val ADE
-- **Metrics logged**: ADE, FDE, loss_x, loss_y, grad_norm per epoch
+- **Metrics logged to W&B**: ADE, FDE, loss, grad_norm per epoch
 
 ### `dagger/collector.py`
 Parses AlpaSim's binary `.asl` protobuf rollout logs. For each simulation step:
 1. Reads `driver_camera_image` entries → buffers JPEG frames per camera per timestamp
-2. Reads `driver_request` entries → marks a new decision step, picks closest camera frames
-3. Reads `driver_return` entries → extracts teacher's planned trajectory (x, y waypoints)
-4. Writes `samples.parquet` (metadata) + `step_*_imgs.npz` (camera images) per rollout
+2. Reads `driver_ego_trajectory` entries → extracts real ego speed from `dynamic_states.linear_velocity`
+3. Reads `driver_request` entries → marks a new decision step, picks closest camera frames
+4. Reads `driver_return` entries → extracts teacher's planned trajectory (up to 65 poses, 6.4s)
+5. Writes `samples.parquet` (metadata) + `step_*_imgs.npz` (camera images) per rollout
+
+Note: speed is read from the actual simulation state, not hardcoded — this was a critical bug fix from v1.
 
 ### `student_model.py`
 Defines the neural network and its AlpaSim driver interface.
@@ -156,11 +179,15 @@ Concatenate (4 × 512 = 2048-d)
     │
     ├── Speed + Acceleration → Linear(2→64) → ReLU
     │
-Fuse → Linear(2112→512) → ReLU → Linear(512→256) → ReLU → Linear(256→20)
+Fuse → Linear(2112→512) → ReLU → Linear(512→256) → ReLU → Linear(256→50)
     │
     ▼
-10 waypoints × (x, y) = 1 second trajectory at 10 Hz
+25 waypoints × (x, y) = 2.5 second trajectory at 10 Hz
 ```
+
+The teacher (Alpamayo 1.5) provides 65 poses per step (6.4s), so the full
+teacher trajectory is available in collected data — the 25-waypoint target
+is a truncation of it, not fabricated.
 
 **StudentModel** wraps StudentNet with the `BaseTrajectoryModel` interface that
 AlpaSim's driver service expects — handling camera ordering, image preprocessing
@@ -182,7 +209,7 @@ Three cost functions used by the MPC planner:
 Hydra config that tells AlpaSim how to run the student driver:
 - Which model class to instantiate (`student` entry point)
 - Camera IDs to request from sensorsim
-- Checkpoint path inside the container (`/mnt/checkpoints/student_iter_N.pth`)
+- Checkpoint path inside the container (`/mnt/checkpoints/student_iter_N_best.pth`)
 
 ### `configs/driver/student_camera_configs.yaml`
 Uses `@package _global_` to inject the 4-camera simulation spec at the root
@@ -216,11 +243,11 @@ dagger_run_v2/
 │   │           └── metrics.parquet ← Long-format metrics (collision, progress, etc.)
 │   └── dataset/
 │       └── <rollout_id>/
-│           ├── samples.parquet     ← (timestamp, trajectory, img_file) per step
+│           ├── samples.parquet     ← (timestamp, speed, trajectory, img_file) per step
 │           └── step_*_imgs.npz     ← Camera images per step
 │
 ├── iter_1/
-│   ├── student_run/                ← Student drives
+│   ├── student_run/                ← Student drives (curriculum scenes)
 │   ├── teacher_correction_run/     ← Teacher re-drives failed scenes
 │   └── dataset/
 │
@@ -229,17 +256,56 @@ dagger_run_v2/
 
 ---
 
+## Scenes
+
+5 scenes from HuggingFace `nvidia/PhysicalAI-Autonomous-Vehicles-NuRec` (910 scenes total):
+
+| Scene ID | Batch | Role |
+|----------|-------|------|
+| `clipgt-01d503d4-...` | Batch0005 | Default — straightforward lane keeping |
+| `clipgt-a309e228-...` | Batch0005 | Turning scene — historically hardest |
+| `clipgt-804afc4a-...` | Batch0005 | Mixed geometry |
+| `clipgt-1bccdc21-...` | Batch0002 | Different lighting/geometry |
+| `clipgt-6e190b33-...` | Batch0010 | Maximum diversity |
+
+Scenes are downloaded automatically via `HF_TOKEN` in `.env`.
+
+---
+
 ## Metrics Glossary
 
 | Metric | Meaning |
 |--------|---------|
 | `collision_any` | 1.0 if the ego vehicle collided with anything during the rollout |
-| `offroad` | 1.0 if the ego vehicle left the drivable area |
+| `offroad` | 1.0 if the ego vehicle left the drivable area at any point |
+| `plan_deviation` | Max deviation from the teacher's planned path (metres). Threshold: > 2.5 triggers correction |
 | `progress` | Fraction of the route completed (0.0–1.0) |
-| `dist_traveled` | Total metres driven before failure or completion |
-| `ADE` | Average Displacement Error — mean distance (metres) between predicted and teacher waypoints across all timesteps |
-| `FDE` | Final Displacement Error — distance at the last waypoint only |
+| `progress_rel` | Progress relative to current GT segment — better real-time signal |
+| `dist_traveled_m` | Total metres driven before failure or completion |
+| `wrong_lane` | 1.0 if ego drove in the opposing lane |
+| `ADE` | Average Displacement Error — mean distance (metres) between predicted and teacher waypoints across all 25 timesteps |
+| `FDE` | Final Displacement Error — distance at the 25th waypoint only |
 | `val ADE` | ADE measured on the held-out 10% validation split |
+
+---
+
+## Training History
+
+### v1 (iters 1–30, speed bug present)
+- Speed hardcoded to 0.0 for all training samples — model never learned speed conditioning
+- 10 waypoints (1s horizon)
+- Single teacher scene
+- Best val ADE: ~0.008m at iter 21 (but model failed turns in simulation)
+- All 3 scenes: `01d503d4` passed, `a309e228` offroad 100%, `804afc4a` passed
+
+### v2 (current)
+- Speed fix: reads real ego speed from `driver_ego_trajectory.dynamic_states`
+- 25 waypoints (2.5s horizon)
+- Curriculum: 2 → 3 → 5 scenes over 16 iterations
+- Teacher corrections on 2 scenes from iter 0
+- Weighted sampling: recent iters 2× older ones
+- Stagnation check: exits after pass rate plateaus
+- Best val ADE: ~0.036m at iter 6 (significantly better generalisation expected)
 
 ---
 
@@ -263,102 +329,60 @@ trajectory during deployment, entering states it never saw during training — t
 4. Return best π_i by validation performance
 ```
 
-The key insight is step 3b — even though the **student** is driving and making
-mistakes, the **teacher** labels every state the student visits. Over iterations,
-the training distribution shifts to match the student's actual deployment
-distribution, eliminating covariate shift.
-
 In this project:
 - **π\*** = Alpamayo 1.5 (the teacher)
-- **π_i** = StudentNet checkpoint `student_iter_i.pth`
-- **States** = 4-camera image + speed/acceleration
-- **Actions** = 10-waypoint trajectory (1 second horizon)
-
----
+- **π_i** = StudentNet checkpoint `student_iter_i_best.pth`
+- **States** = 4-camera image + speed + acceleration
+- **Actions** = 25-waypoint trajectory (2.5 second horizon at 10 Hz)
 
 ### Imitation Learning (Behavioural Cloning)
-The base form of learning from demonstrations. The student is trained as a
-supervised regression problem:
+The base form of learning from demonstrations:
 
 ```
 L = (1/T) Σ_t ||π_student(s_t) - π_teacher(s_t)||²
 ```
 
-Where `s_t` is the observation at time t and the output is a trajectory.
-No reward signal is needed — only expert demonstrations. The limitation (fixed
-by DAgger) is that errors compound: a small deviation puts the student in a
-state the teacher never demonstrated, leading to larger deviations.
-
----
+Where `s_t` is the observation at time t and T=25 waypoints. No reward signal
+needed — only expert demonstrations. DAgger fixes the covariate shift limitation.
 
 ### ResNet18 (Visual Encoder)
-A residual convolutional neural network with 18 layers. "Residual" means each
-block learns a residual `F(x) = H(x) - x` rather than the full mapping `H(x)`,
-with the input added back: `output = F(x) + x`. This makes gradients flow more
-easily through deep networks, solving the vanishing gradient problem.
-
-Used here as a frozen-weight-free feature extractor: each of the 4 camera images
-is passed through ResNet18 to produce a 512-dimensional feature vector.
-
----
+A residual convolutional neural network with 18 layers. Each of the 4 camera images
+is passed through ResNet18 to produce a 512-dimensional feature vector, giving
+2048-d total visual features before fusion with the state.
 
 ### AdamW (Optimiser)
-Adam with **decoupled weight decay**. Standard Adam applies weight decay inside
-the gradient update (L2 regularisation), which interacts badly with the adaptive
-learning rate. AdamW applies weight decay directly to the weights, independent
-of the gradient — this gives cleaner regularisation and better generalisation,
-especially on small datasets like ours.
-
-```
-θ_t = θ_{t-1} - α * (m̂_t / (√v̂_t + ε)) - α * λ * θ_{t-1}
-```
-Where `m̂_t` and `v̂_t` are bias-corrected first and second moment estimates,
-and `λ` is the weight decay coefficient.
-
----
+Adam with decoupled weight decay. Applies weight decay directly to weights
+independent of the gradient — cleaner regularisation on small datasets.
 
 ### OneCycleLR (Learning Rate Schedule)
-Starts with a low learning rate, ramps up to a peak over ~10% of training
-(warmup), then decays back down via cosine annealing. Proposed by Smith &
-Topin (2018) as "Super-Convergence". Benefits:
-- The warmup phase prevents early instability on a new dataset
-- The high peak LR helps escape shallow local minima
-- The cosine decay fine-tunes the solution at the end
-
-In this project: `lr_min → lr_max (3e-4) → lr_final` over 30 epochs.
-
----
+Warmup to peak LR (3e-4) over ~10% of training, then cosine decay to near-zero.
+Prevents early instability, helps escape shallow local minima, fine-tunes at end.
 
 ### ADE / FDE (Trajectory Error Metrics)
-Standard evaluation metrics for trajectory prediction:
+- **ADE**: mean Euclidean distance across all 25 predicted waypoints vs teacher
+- **FDE**: Euclidean distance at the 25th (final) waypoint only
 
-- **ADE** (Average Displacement Error): mean Euclidean distance between the
-  predicted waypoints and the ground-truth (teacher) waypoints, averaged over
-  all T timesteps in the horizon:
-  ```
-  ADE = (1/T) Σ_t ||ŷ_t - y_t||₂
-  ```
-
-- **FDE** (Final Displacement Error): Euclidean distance at only the last
-  waypoint, measuring how well the model captures the long-term intent:
-  ```
-  FDE = ||ŷ_T - y_T||₂
-  ```
-
-Lower is better for both. The student reached val ADE ~0.029m after 6 DAgger
-iterations (compared to the raw prediction at iter 0 before any training).
-
----
+Both in metres. Lower is better. FDE is more sensitive to long-horizon accuracy.
 
 ### APF (Artificial Potential Field)
-A classical path planning technique where the ego vehicle is treated as a
-particle in a potential field. Obstacles create **repulsive** potentials and
-the goal creates an **attractive** potential. The vehicle follows the gradient
-of the combined field.
-
-Used in `cost_filter.py` for the safety cost component of MPC refinement:
+Used in `cost_filter.py` for obstacle avoidance in the optional MPC refinement:
 ```
 U_rep(d) = 0.5 * k_rep * (1/d - 1/d₀)²   if d < d₀
            0                                otherwise
 ```
-Where `d` is distance to the nearest obstacle and `d₀` is the influence radius.
+Where `d` is distance to nearest obstacle and `d₀` is the influence radius.
+
+### Next Steps (Post-DAgger)
+After DAgger convergence, fine-tuning with **SAC (Soft Actor-Critic)** is the
+recommended next step. SAC is preferred over PPO due to:
+- Off-policy replay buffer: reuses all rollout data, critical given slow sim (~2hrs/scene)
+- DAgger dataset pre-seeds the replay buffer with labelled demonstrations
+- Entropy maximisation encourages exploration of edge cases (turns, recovery)
+- PPO would require ~42–200 days compute from scratch; SAC fine-tuning from DAgger: ~1–2 weeks
+
+Required changes for SAC:
+- Add Q-networks + stochastic policy head to StudentNet
+- Replace MSE loss with soft Q-loss + policy loss
+- Replace collector with (s, a, r, s', done) tuple extraction
+- Pre-fill replay buffer from existing DAgger rollout data
+- Reward from simulator's per-timestep metrics: `progress_rel`, `dist_to_gt_trajectory`, `offroad`, `collision_any`
