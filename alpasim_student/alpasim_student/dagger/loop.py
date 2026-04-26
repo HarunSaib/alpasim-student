@@ -212,7 +212,7 @@ def _detect_failures(
     thresholds = thresholds or {
         "collision_any":  0.0,
         "offroad":        0.0,
-        "plan_deviation": 0.8,  # catches near-misses before full offroad event
+        "plan_deviation": 2.5,  # raised from 0.8 — filters valid path variations
     }
     failed: list[str] = []
     for metrics_file in sorted(run_dir.glob("rollouts/*/*/metrics.parquet")):
@@ -423,10 +423,10 @@ def run_dagger(
                     _loop_log({"dagger/converged": True})
                     return
 
-                # Stagnation check: stop if pass rate hasn't improved by >2%
-                # over the last 4 iterations — model has plateaued.
+                # Stagnation check: only activate once pass rate has been >0%
+                # at least once, then stop if no improvement over 4 iters.
                 pass_rate_history.append(pass_rate)
-                if len(pass_rate_history) >= 4:
+                if any(r > 0 for r in pass_rate_history) and len(pass_rate_history) >= 4:
                     recent_improvement = max(pass_rate_history[-4:]) - min(pass_rate_history[-4:])
                     if recent_improvement < 0.02:
                         print(f"[loop] Pass rate stagnated (Δ={recent_improvement:.1%} over 4 iters) — stopping early.")

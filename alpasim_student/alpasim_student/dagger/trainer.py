@@ -26,7 +26,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import wandb
-from torch.utils.data import ConcatDataset, DataLoader, Dataset, random_split
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, WeightedRandomSampler, random_split
 from torchvision import transforms as T
 
 from ..student_model import StudentNet
@@ -212,8 +212,23 @@ def train(
     print(f"[trainer] {n_total} samples across {len(data_dirs)} dataset(s): {samples_per_iter}")
     print(f"[trainer] train={n_train}  val={n_val}  epochs={num_epochs}  lr={lr}")
 
+    # Weight recent iterations 2× more than older ones so hard/new scenes
+    # don't get diluted as the dataset grows across DAgger iterations.
+    sample_weights = []
+    for idx in train_ds.indices:
+        # Find which dataset (iter) this sample belongs to
+        cumulative = 0
+        for iter_idx, ds in enumerate(datasets):
+            cumulative += len(ds)
+            if idx < cumulative:
+                # More recent iters get higher weight
+                sample_weights.append(1.0 + iter_idx / max(1, len(datasets) - 1))
+                break
+    sampler = WeightedRandomSampler(
+        weights=sample_weights, num_samples=len(sample_weights), replacement=True
+    )
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
+        train_ds, batch_size=batch_size, sampler=sampler,
         num_workers=4, pin_memory=True, drop_last=False,
     )
     val_loader = DataLoader(
