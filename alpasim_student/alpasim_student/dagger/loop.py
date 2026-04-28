@@ -365,6 +365,7 @@ def run_dagger(
         _loop_log({})  # no-op log just to ensure run is open
 
     pass_rate_history: list[float] = []
+    _curriculum_n_scenes: int = 0   # tracks scene count; reset history on expansion
 
     # Seed all_data_dirs from already-collected datasets for iterations before start_iteration.
     for i in range(start_iteration):
@@ -387,6 +388,14 @@ def run_dagger(
         iter_teacher_scene_ids = _curriculum_scenes(iteration, teacher_scene_ids)
         print(f"[loop] Curriculum: {len(iter_scene_ids)} student scenes, "
               f"{len(iter_teacher_scene_ids)} teacher scenes (iter {iteration})")
+
+        # Reset stagnation history whenever curriculum expands — pass rates are
+        # not comparable across different scene sets (harder set always looks worse).
+        if len(iter_scene_ids) > _curriculum_n_scenes:
+            if _curriculum_n_scenes > 0:
+                print(f"[loop] Curriculum expanded {_curriculum_n_scenes}→{len(iter_scene_ids)} scenes — resetting stagnation history.")
+            _curriculum_n_scenes = len(iter_scene_ids)
+            pass_rate_history = []
 
         if iteration == 0 or student_ckpt is None:
             print("\n[loop] Phase 1: bootstrapping with Alpamayo 1.5 teacher...")
