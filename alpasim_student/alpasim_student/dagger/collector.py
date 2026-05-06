@@ -110,7 +110,11 @@ async def _extract_rollout(asl_path: Path, out_dir: Path) -> int:
             if not poses or not pending_images:
                 continue
 
-            # Extract (x, y) world coordinates then convert to ego-relative
+            # Extract (x, y) world coordinates then convert to ego-relative.
+            # Slice to NUM_WAYPOINTS (40) to match the student model's output size.
+            # Teacher provides 65 poses (~6.4 s); we use the first 40 (4.0 s @ 10 Hz).
+            from alpasim_student.student_model import StudentNet
+            poses = poses[: StudentNet.NUM_WAYPOINTS]
             traj_world = [[float(p.pose.vec.x), float(p.pose.vec.y)] for p in poses]
             x0, y0 = traj_world[0]
             traj_xy = [[x - x0, y - y0] for x, y in traj_world]
