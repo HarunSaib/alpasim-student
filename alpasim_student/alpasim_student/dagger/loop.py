@@ -545,6 +545,6 @@ if __name__ == "__main__":
         epochs_per_iter     = args.epochs,
         start_iteration     = args.start_iteration,
         initial_checkpoint  = Path(args.initial_checkpoint) if args.initial_checkpoint else None,
-        scene_ids           = args.scenes or DEFAULT_SCENE_IDS,
-        teacher_scene_ids   = DEFAULT_SCENE_IDS[:2],
+        scene_ids           = args.scenes or ALL_SCENE_IDS,
+        teacher_scene_ids   = ALL_SCENE_IDS[:2],
     )
