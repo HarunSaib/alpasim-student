@@ -37,15 +37,42 @@ CAMERA_ORDER = [
 ]
 
 
+# Maximum number of actor slots the detection head predicts (BEV ego frame).
+K_MAX_ACTORS = 8
+
+
+class DetectionHead(nn.Module):
+    """Predicts up to K_MAX_ACTORS actor positions in ego BEV frame.
+
+    Output per slot: (x_ego_m, y_ego_m, existence_logit).
+    Trained with Hungarian matching against ground-truth actor_poses from the
+    .asl log; at inference the logit > 0 threshold selects present actors.
+    """
+
+    def __init__(self, in_dim: int, k_max: int = K_MAX_ACTORS):
+        super().__init__()
+        self.k_max = k_max
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, k_max * 3),  # (x, y, logit) per slot
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns (B, k_max, 3): columns are (x_ego, y_ego, existence_logit)."""
+        return self.net(x).view(x.shape[0], self.k_max, 3)
+
+
 class StudentNet(nn.Module):
-    """ResNet18 backbone + state fusion + trajectory MLP.
+    """ResNet18 backbone + state fusion + trajectory MLP + detection head.
 
     Architecture:
         Visual branch:  ResNet18 (no final FC) → 512-d per camera
         State branch:   [speed, accel] → Linear(2, 64) → ReLU
-        Head:           Linear(512*N_cam + 64, 512) → ReLU
-                        → Linear(512, 256) → ReLU
+        Fused:          concat → 2112-d
+        Traj head:      Linear(2112, 512) → ReLU → Linear(512, 256) → ReLU
                         → Linear(256, T*2)
+        Det head:       Linear(2112, 256) → ReLU → Linear(256, K*3)
 
     ~30 M parameters.  Fits in < 500 MB VRAM.
     """
@@ -61,34 +88,41 @@ class StudentNet(nn.Module):
         # Drop the average-pool + FC — we keep the spatial feature map then pool.
         self.visual = nn.Sequential(*list(backbone.children())[:-1])  # → (B, 512, 1, 1)
         visual_dim = 512 * num_cameras
+        fused_dim = visual_dim + 64
 
         self.state_enc = nn.Sequential(
             nn.Linear(self.STATE_DIM, 64),
             nn.ReLU(),
         )
         self.head = nn.Sequential(
-            nn.Linear(visual_dim + 64, 512),
+            nn.Linear(fused_dim, 512),
             nn.ReLU(),
             nn.Linear(512, 256),
             nn.ReLU(),
             nn.Linear(256, self.NUM_WAYPOINTS * 2),
         )
+        self.det_head = DetectionHead(fused_dim)
         self._num_cameras = num_cameras
 
-    def forward(self, images: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, images: torch.Tensor, state: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             images: (B, N_cam, 3, H, W) float32 normalised.
             state:  (B, STATE_DIM) float32.
         Returns:
-            (B, NUM_WAYPOINTS, 2) trajectory in rig frame (x-forward, y-left).
+            traj: (B, NUM_WAYPOINTS, 2) trajectory in rig frame (x-forward, y-left).
+            det:  (B, K_MAX_ACTORS, 3) actor slots (x_ego, y_ego, existence_logit).
         """
         B, N, C, H, W = images.shape
         feats = self.visual(images.view(B * N, C, H, W))   # (B*N, 512, 1, 1)
         feats = feats.view(B, N * 512)                      # (B, N*512)
         state_feat = self.state_enc(state)                  # (B, 64)
-        out = self.head(torch.cat([feats, state_feat], dim=1))
-        return out.view(B, self.NUM_WAYPOINTS, 2)
+        fused = torch.cat([feats, state_feat], dim=1)       # (B, 2112)
+        traj = self.head(fused).view(B, self.NUM_WAYPOINTS, 2)
+        det = self.det_head(fused)                          # (B, K_MAX, 3)
+        return traj, det
 
 
 class StudentModel(BaseTrajectoryModel):
@@ -113,7 +147,11 @@ class StudentModel(BaseTrajectoryModel):
         self._net = StudentNet(num_cameras=len(camera_ids)).to(device)
         if checkpoint_path and Path(checkpoint_path).exists():
             state = torch.load(checkpoint_path, map_location=device, weights_only=True)
-            self._net.load_state_dict(state)
+            missing, unexpected = self._net.load_state_dict(state, strict=False)
+            if missing:
+                logger.info("Checkpoint missing keys (new head, random init): %s", missing)
+            if unexpected:
+                logger.warning("Checkpoint has unexpected keys: %s", unexpected)
             logger.info("Loaded student checkpoint from %s", checkpoint_path)
         else:
             logger.warning(
@@ -179,11 +217,18 @@ class StudentModel(BaseTrajectoryModel):
         )
 
         with torch.no_grad():
-            traj = self._net(images, state)[0].cpu().numpy()   # (T, 2)
+            traj_t, det_t = self._net(images, state)
+            traj = traj_t[0].cpu().numpy()   # (T, 2)
 
-        # Optional MPC cost refinement (no obstacles by default — extend here).
+        # Feed detected actors into MPC cost refinement when enabled.
         if self._use_cost_refinement:
-            obstacle_positions = np.empty((0, 2), dtype=np.float32)
+            det_np = det_t[0].cpu().numpy()           # (K, 3)
+            present = det_np[:, 2] > 0                # existence logit threshold
+            obstacle_positions = (
+                det_np[present, :2].astype(np.float32)
+                if present.any()
+                else np.empty((0, 2), dtype=np.float32)
+            )
             traj = refine_trajectory(traj, obstacle_positions)
 
         headings = self._compute_headings_from_trajectory(traj)

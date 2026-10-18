@@ -15,11 +15,14 @@ Actual .asl entry kinds used:
     driver_camera_image   – camera frame (camera_image.logical_id / image_bytes / frame_start_us)
     driver_request        – ego step marker  (time_now_us)
     driver_return         – teacher trajectory (trajectory.poses[].pose.vec.x/y)
+    actor_poses           – all actor world poses including EGO (timestamp_us / actor_id / pose)
+    rollout_metadata      – actor_definitions with labels per actor_id
 """
 from __future__ import annotations
 
 import asyncio
 import io
+import math
 import sys
 from pathlib import Path
 
@@ -29,6 +32,13 @@ from PIL import Image
 
 from alpasim_utils.logs import async_read_pb_log
 
+# Actors beyond this range (metres, ego frame) are outside the model's useful
+# perception window and excluded from the detection supervision signal.
+_MAX_ACTOR_RANGE_M = 60.0
+
+# Maximum number of actor slots stored per step (closest actors by distance).
+_MAX_ACTORS = 8
+
 
 def _lookup_speed(speed_buffer: dict[int, float], ts: int) -> float:
     """Return speed at ts by finding the nearest key in speed_buffer."""
@@ -36,6 +46,44 @@ def _lookup_speed(speed_buffer: dict[int, float], ts: int) -> float:
         return 0.0
     closest = min(speed_buffer.keys(), key=lambda t: abs(t - ts))
     return speed_buffer[closest]
+
+
+def _world_to_ego(
+    wx: float, wy: float,
+    ego_x: float, ego_y: float, ego_yaw: float,
+) -> tuple[float, float]:
+    """Transform a world-frame (wx, wy) point into ego BEV frame."""
+    dx, dy = wx - ego_x, wy - ego_y
+    c, s = math.cos(ego_yaw), math.sin(ego_yaw)
+    return c * dx + s * dy, -s * dx + c * dy
+
+
+def _actors_in_ego_frame(
+    actor_poses_at_ts: list[tuple],
+    non_ego_ids: set[str],
+) -> list[list[float]]:
+    """Return [[x_ego, y_ego], ...] for non-EGO actors within range, closest first."""
+    ego_x = ego_y = ego_yaw = None
+    for actor_id, ax, ay, qz, qw in actor_poses_at_ts:
+        if actor_id == "EGO":
+            ego_x, ego_y = ax, ay
+            ego_yaw = 2.0 * math.atan2(qz, qw)
+            break
+
+    if ego_x is None:
+        return []
+
+    with_dist = []
+    for actor_id, ax, ay, _, _ in actor_poses_at_ts:
+        if actor_id not in non_ego_ids:
+            continue
+        x_rel, y_rel = _world_to_ego(ax, ay, ego_x, ego_y, ego_yaw)
+        dist = math.hypot(x_rel, y_rel)
+        if dist <= _MAX_ACTOR_RANGE_M:
+            with_dist.append((dist, x_rel, y_rel))
+
+    with_dist.sort()
+    return [[x, y] for _, x, y in with_dist[:_MAX_ACTORS]]
 
 
 async def _extract_rollout(asl_path: Path, out_dir: Path) -> int:
@@ -54,13 +102,44 @@ async def _extract_rollout(asl_path: Path, out_dir: Path) -> int:
     # speed_buffer[timestamp_us] = speed_m_s from ego dynamic states
     speed_buffer: dict[int, float] = {}
 
+    # actor_poses_buffer[timestamp_us] = [(actor_id, x, y, qz, qw), ...]
+    actor_poses_buffer: dict[int, list[tuple]] = {}
+
+    # non-EGO actor ids discovered from rollout_metadata.actor_definitions
+    non_ego_ids: set[str] = set()
+
     async for entry in async_read_pb_log(str(asl_path)):
         kind = entry.WhichOneof("log_entry")
 
         # ------------------------------------------------------------------ #
+        # Rollout metadata: collect non-EGO actor ids and labels             #
+        # ------------------------------------------------------------------ #
+        if kind == "rollout_metadata":
+            for aabb in entry.rollout_metadata.actor_definitions.actor_aabb:
+                if aabb.actor_id != "EGO":
+                    non_ego_ids.add(aabb.actor_id)
+
+        # ------------------------------------------------------------------ #
+        # Actor world poses (all agents including EGO) at each sim step      #
+        # ------------------------------------------------------------------ #
+        elif kind == "actor_poses":
+            ap = entry.actor_poses
+            ts = int(ap.timestamp_us)
+            actor_poses_buffer[ts] = [
+                (
+                    p.actor_id,
+                    float(p.actor_pose.vec.x),
+                    float(p.actor_pose.vec.y),
+                    float(p.actor_pose.quat.z),
+                    float(p.actor_pose.quat.w),
+                )
+                for p in ap.actor_poses
+            ]
+
+        # ------------------------------------------------------------------ #
         # Accumulate rendered camera images keyed by their frame timestamp    #
         # ------------------------------------------------------------------ #
-        if kind == "driver_camera_image":
+        elif kind == "driver_camera_image":
             ci = entry.driver_camera_image.camera_image
             ts = int(ci.frame_start_us)
             cam_id = ci.logical_id
@@ -119,14 +198,25 @@ async def _extract_rollout(asl_path: Path, out_dir: Path) -> int:
             x0, y0 = traj_world[0]
             traj_xy = [[x - x0, y - y0] for x, y in traj_world]
 
+            # Actor positions in ego BEV frame from the nearest logged actor_poses
+            # entry (within 200 ms of this decision step).
+            actor_positions_ego: list[list[float]] = []
+            if actor_poses_buffer and non_ego_ids:
+                best_ap_ts = min(actor_poses_buffer, key=lambda t: abs(t - current_ts))
+                if abs(best_ap_ts - current_ts) < 200_000:
+                    actor_positions_ego = _actors_in_ego_frame(
+                        actor_poses_buffer[best_ap_ts], non_ego_ids
+                    )
+
             img_file = out_dir / f"step_{current_ts:015d}_imgs.npz"
             np.savez_compressed(str(img_file), **pending_images)
 
             records.append({
-                "timestamp_us": current_ts,
-                "traj_xy":      traj_xy,
-                "speed":        _lookup_speed(speed_buffer, current_ts),
-                "img_file":     str(img_file),
+                "timestamp_us":        current_ts,
+                "traj_xy":             traj_xy,
+                "speed":               _lookup_speed(speed_buffer, current_ts),
+                "img_file":            str(img_file),
+                "actor_positions_ego": actor_positions_ego,
             })
 
             pending_images = {}   # consume; next step needs new images

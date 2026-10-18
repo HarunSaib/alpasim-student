@@ -11,7 +11,7 @@ model:
   model_type: student
   # Updated automatically by dagger/loop.py after each training iteration.
   # Set manually for standalone runs.
-  checkpoint_path: "/mnt/checkpoints/student_iter_5.pth"
+  checkpoint_path: "/mnt/checkpoints/student_iter_8_best.pth"
   device: "cuda"
 
 host: "0.0.0.0"

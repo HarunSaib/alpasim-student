@@ -18,10 +18,11 @@ dependencies = [
 ]
 
 [project.entry-points."alpasim.models"]
-student = "alpasim_student.student_model:StudentModel"
+student  = "alpasim_student.student_model:StudentModel"
+alpanet  = "alpasim_student.alpanet.model:AlpaNetModel"
 
 [project.entry-points."alpasim.configs"]
-student = "alpasim_student.configs"
+student  = "alpasim_student.configs"
 
 [build-system]
 requires = ["hatchling"]

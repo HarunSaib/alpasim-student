@@ -155,12 +155,41 @@ def _run_wizard(
                     "uv run --no-sync -m alpasim_driver.main",
                 )
 
+            # Add PYTORCH_CUDA_ALLOC_CONF to driver-0 to prevent inference OOM
+            # when Alpamayo shares GPU memory with the sensor simulator.
+            alloc_env = (
+                "    environment:\n"
+                "      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True\n"
+            )
+            if "PYTORCH_CUDA_ALLOC_CONF" not in driver_block and "    image:" in driver_block:
+                driver_block = driver_block.replace("    image:", alloc_env + "    image:", 1)
+
             return before_driver + driver_block + rest_after
 
         new_patched = patch_driver_block(patched)
         if new_patched != patched:
             patched = new_patched
             print(f"[loop] Patched {compose_file}: added student install to driver-0 service")
+
+        # Move all GPU-1 services to GPU-0 — GPU 1 may be occupied by other
+        # processes leaving insufficient VRAM for the sensor simulator.
+        patched = patched.replace(
+            "              device_ids:\n                - '1'",
+            "              device_ids:\n                - '0'",
+        )
+
+        # Reduce fragmentation-induced OOM during sensor rendering.
+        patched = patched.replace(
+            "    environment:\n      - OMP_NUM_THREADS=1",
+            "    environment:\n      - OMP_NUM_THREADS=1\n      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+        )
+        patched = patched.replace(
+            "    environment:\n      - WARP_CACHE_PATH='/mnt/warp'",
+            "    environment:\n      - WARP_CACHE_PATH='/mnt/warp'\n      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+        )
+
+        # Reduce sensorsim GPU memory: fewer cached scenes and render workers.
+        patched = patched.replace("--cache-size=5 --max-workers=4", "--cache-size=2 --max-workers=2")
 
         if patched != original:
             compose_file.write_text(patched)
@@ -169,9 +198,15 @@ def _run_wizard(
     # ── Step 3: run docker compose ────────────────────────────────────────────
     run_cmd = ["docker", "compose", "-f", str(compose_file), "up"]
     print(f"[loop] $ {' '.join(run_cmd)}")
-    result = subprocess.run(run_cmd, cwd=log_dir, env=env)
-    if result.returncode != 0:
-        raise RuntimeError(f"docker compose up exited with code {result.returncode}")
+    try:
+        result = subprocess.run(run_cmd, cwd=log_dir, env=env)
+        if result.returncode != 0:
+            raise RuntimeError(f"docker compose up exited with code {result.returncode}")
+    finally:
+        subprocess.run(
+            ["docker", "compose", "-f", str(compose_file), "down", "--remove-orphans"],
+            cwd=log_dir, env=env, check=False,
+        )
 
 
 def _pivot_metrics(df: pd.DataFrame) -> dict[str, float]:
@@ -321,13 +356,23 @@ def run_dagger(
     initial_checkpoint: Path | None = None,
     scene_ids: list[str] | None = None,
     teacher_scene_ids: list[str] | None = None,
+    model: str = "student",   # "student" or "alpanet"
 ) -> None:
     import wandb
 
+    # Pin CWD to repo root so that uv (and wandb service subprocesses) can
+    # find pyproject.toml regardless of where the shell launched us from.
+    os.chdir(ALPASIM_ROOT)
+
     _load_env()
+
+    if model not in ("student", "alpanet"):
+        raise ValueError(f"--model must be 'student' or 'alpanet', got {model!r}")
 
     from .collector import collect_from_run
     from .trainer import train
+    if model == "alpanet":
+        from .alpanet_trainer import train as train  # noqa: F811 — shadows above
 
     base_dir = Path(base_dir)
     all_data_dirs: list[Path] = []
@@ -418,10 +463,10 @@ def run_dagger(
             print("\n[loop] Phase 1a: running student in simulation...")
             student_run = iter_dir / "student_run"
 
-            # Update student.yaml checkpoint path before launching
-            _patch_student_checkpoint(student_ckpt)
+            # Update driver yaml checkpoint path before launching
+            _patch_student_checkpoint(student_ckpt, driver=model)
             # Use 2gpu_alpamayo topology (has all required config fields)
-            _run_wizard("student", student_run, topology="2gpu_alpamayo", base_dir=base_dir, scene_ids=iter_scene_ids)
+            _run_wizard(model, student_run, topology="2gpu_alpamayo", base_dir=base_dir, scene_ids=iter_scene_ids)
 
             # Log student eval metrics to W&B
             _loop_log(_build_eval_log(student_run, iteration, "student"))
@@ -475,21 +520,21 @@ def run_dagger(
         # ------------------------------------------------------------------ #
         # Step 3  Train student on all data collected so far (dataset agg.)   #
         # ------------------------------------------------------------------ #
-        ckpt_out = base_dir / "checkpoints" / f"student_iter_{iteration + 1}.pth"
-        best_ckpt_out = base_dir / "checkpoints" / f"student_iter_{iteration + 1}_best.pth"
-        print(f"\n[loop] Phase 3: training student ({len(all_data_dirs)} dataset(s))...")
+        ckpt_out      = base_dir / "checkpoints" / f"{model}_iter_{iteration + 1}.pth"
+        best_ckpt_out = base_dir / "checkpoints" / f"{model}_iter_{iteration + 1}_best.pth"
+        print(f"\n[loop] Phase 3: training {model} ({len(all_data_dirs)} dataset(s))...")
         train(
             data_dirs      = all_data_dirs,
             checkpoint_out = ckpt_out,
             num_epochs     = epochs_per_iter,
-            device_str     = "cuda:1",
+            device_str     = "cuda:0",
             resume_from    = str(student_ckpt) if student_ckpt else None,
             dagger_iter    = iteration + 1,
         )
         # train() calls wandb.finish() — _loop_log will reinit the run if needed
         # Prefer the best-val-ADE checkpoint for the next simulation run.
         student_ckpt = best_ckpt_out if best_ckpt_out.exists() else ckpt_out
-        print(f"[loop] Student checkpoint: {student_ckpt}")
+        print(f"[loop] {model} checkpoint: {student_ckpt}")
 
         _loop_log({
             "dagger/num_datasets": len(all_data_dirs),
@@ -500,17 +545,16 @@ def run_dagger(
     print("\n[loop] DAgger loop finished.")
 
 
-def _patch_student_checkpoint(ckpt_path: Path) -> None:
-    """Overwrite the checkpoint_path in the student driver YAML.
+def _patch_student_checkpoint(ckpt_path: Path, driver: str = "student") -> None:
+    """Overwrite the checkpoint_path in the driver YAML (student or alpanet).
 
     The checkpoint is mounted inside the driver container at /mnt/checkpoints/<filename>,
     so the YAML path must use the container-side path, not the host path.
     """
     yaml_path = (
         ALPASIM_ROOT
-        / "plugins/alpasim_student/alpasim_student/configs/driver/student.yaml"
+        / f"plugins/alpasim_student/alpasim_student/configs/driver/{driver}.yaml"
     )
-    # Container sees checkpoints dir as /mnt/checkpoints/
     container_ckpt = "/mnt/checkpoints/" + Path(ckpt_path).name
     text = yaml_path.read_text()
     lines = []
@@ -521,7 +565,7 @@ def _patch_student_checkpoint(ckpt_path: Path) -> None:
         else:
             lines.append(line)
     yaml_path.write_text("\n".join(lines) + "\n")
-    print(f"[loop] Updated student checkpoint path → {container_ckpt} (host: {ckpt_path})")
+    print(f"[loop] Updated {driver} checkpoint path → {container_ckpt} (host: {ckpt_path})")
 
 
 if __name__ == "__main__":
@@ -537,6 +581,9 @@ if __name__ == "__main__":
                         help="Scene IDs to run (e.g. clipgt-01d503d4-... clipgt-a309e228-...). "
                              "Defaults to the base config scene list (1 scene). "
                              "HF_TOKEN in .env is used to auto-download missing scenes.")
+    parser.add_argument("--model",              default="student",
+                        choices=["student", "alpanet"],
+                        help="Model architecture to train and deploy (default: student).")
     args = parser.parse_args()
 
     run_dagger(
@@ -545,6 +592,7 @@ if __name__ == "__main__":
         epochs_per_iter     = args.epochs,
         start_iteration     = args.start_iteration,
         initial_checkpoint  = Path(args.initial_checkpoint) if args.initial_checkpoint else None,
-        scene_ids           = args.scenes or ALL_SCENE_IDS,
-        teacher_scene_ids   = ALL_SCENE_IDS[:2],
+        scene_ids           = args.scenes or DEFAULT_SCENE_IDS,
+        teacher_scene_ids   = DEFAULT_SCENE_IDS[:2],
+        model               = args.model,
     )

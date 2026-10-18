@@ -25,11 +25,16 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import wandb
+from scipy.optimize import linear_sum_assignment
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, WeightedRandomSampler, random_split
 from torchvision import transforms as T
 
-from ..student_model import StudentNet
+from ..student_model import K_MAX_ACTORS, StudentNet
+
+# Detection loss weight relative to trajectory L1 loss.
+_LAMBDA_DET = 0.1
 
 # Camera order must match StudentModel.camera_ids.
 CAMERA_ORDER = [
@@ -91,7 +96,19 @@ class AlpaSimDataset(Dataset):
 
         state = torch.tensor([float(row.get("speed", 0.0)), 0.0], dtype=torch.float32)
 
-        return images, state, traj
+        # Actor positions in ego BEV frame — padded to K_MAX_ACTORS slots.
+        actor_raw = row.get("actor_positions_ego", None)
+        if actor_raw is None:
+            actor_raw = []
+        elif isinstance(actor_raw, str):
+            actor_raw = ast.literal_eval(actor_raw)
+        actor_pos  = torch.zeros(K_MAX_ACTORS, 2, dtype=torch.float32)
+        actor_mask = torch.zeros(K_MAX_ACTORS, dtype=torch.bool)
+        for i, (x, y) in enumerate(actor_raw[:K_MAX_ACTORS]):
+            actor_pos[i]  = torch.tensor([x, y])
+            actor_mask[i] = True
+
+        return images, state, traj, actor_pos, actor_mask
 
 
 def _compute_traj_metrics(pred: torch.Tensor, gt: torch.Tensor) -> dict[str, float]:
@@ -120,6 +137,44 @@ def _compute_traj_metrics(pred: torch.Tensor, gt: torch.Tensor) -> dict[str, flo
         "loss_y":      loss_y,
         "max_lat_err": max_lat,
     }
+
+
+def _detection_loss(
+    pred: torch.Tensor,
+    gt_pos: torch.Tensor,
+    gt_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Hungarian-matched detection loss over a batch.
+
+    pred:    (B, K, 3) — (x_ego, y_ego, existence_logit)
+    gt_pos:  (B, K, 2) — ground-truth actor positions (zero-padded)
+    gt_mask: (B, K)    — True for real actors, False for padding slots
+    Returns scalar loss weighted by _LAMBDA_DET.
+    """
+    B, K, _ = pred.shape
+    pos_pred = pred[..., :2]   # (B, K, 2)
+    log_pred = pred[..., 2]    # (B, K)
+
+    total_pos  = pred.new_zeros(())
+    total_exist = pred.new_zeros(())
+
+    for b in range(B):
+        n_gt = int(gt_mask[b].sum().item())
+        exist_target = pred.new_zeros(K)
+
+        if n_gt > 0:
+            gt_b = gt_pos[b, :n_gt]                              # (n_gt, 2)
+            with torch.no_grad():
+                cost = torch.cdist(pos_pred[b], gt_b)            # (K, n_gt)
+                rows, cols = linear_sum_assignment(cost.cpu().numpy())
+            total_pos = total_pos + F.l1_loss(pos_pred[b, rows], gt_b[cols])
+            exist_target[rows] = 1.0
+
+        total_exist = total_exist + F.binary_cross_entropy_with_logits(
+            log_pred[b], exist_target
+        )
+
+    return _LAMBDA_DET * (total_pos / B + total_exist / B)
 
 
 def _traj_figure(pred: torch.Tensor, gt: torch.Tensor, n: int = 6) -> "plt.Figure":
@@ -166,7 +221,7 @@ def train(
     datasets = [AlpaSimDataset(d, source_iter=i) for i, d in enumerate(data_dirs)]
     full_dataset = ConcatDataset(datasets)
     n_total = len(full_dataset)
-    n_val   = max(1, int(n_total * VAL_FRAC))
+    n_val   = max(1, int(n_total * VAL_FRAC)) if n_total > 1 else 0
     n_train = n_total - n_val
     train_ds, val_ds = random_split(
         full_dataset, [n_train, n_val],
@@ -241,7 +296,11 @@ def train(
     # ------------------------------------------------------------------ #
     model = StudentNet(num_cameras=len(CAMERA_ORDER)).to(device)
     if resume_from and Path(resume_from).exists():
-        model.load_state_dict(torch.load(resume_from, map_location=device, weights_only=True))
+        missing, _ = model.load_state_dict(
+            torch.load(resume_from, map_location=device, weights_only=True), strict=False
+        )
+        if missing:
+            print(f"[trainer] New keys (random init): {missing}")
         print(f"[trainer] Resumed from {resume_from}")
 
     # AdamW with weight decay for better regularisation than plain Adam
@@ -270,20 +329,25 @@ def train(
     for epoch in range(num_epochs):
         # --- train ---
         model.train()
-        train_loss = 0.0
+        train_loss     = 0.0
+        train_det_loss = 0.0
         train_metrics: dict[str, float] = {
             "ade": 0.0, "fde": 0.0, "loss_x": 0.0, "loss_y": 0.0,
             "max_lat_err": 0.0, "grad_norm": 0.0,
         }
         last_pred, last_gt = None, None
 
-        for images, state, traj_gt in train_loader:
-            images  = images.to(device)
-            state   = state.to(device)
-            traj_gt = traj_gt.to(device)
+        for images, state, traj_gt, actor_pos, actor_mask in train_loader:
+            images     = images.to(device)
+            state      = state.to(device)
+            traj_gt    = traj_gt.to(device)
+            actor_pos  = actor_pos.to(device)
+            actor_mask = actor_mask.to(device)
 
-            traj_pred = model(images, state)
-            loss      = loss_fn(traj_pred, traj_gt)
+            traj_pred, det_pred = model(images, state)
+            traj_loss = loss_fn(traj_pred, traj_gt)
+            det_loss  = _detection_loss(det_pred, actor_pos, actor_mask)
+            loss      = traj_loss + det_loss
 
             optim.zero_grad()
             loss.backward()
@@ -292,7 +356,8 @@ def train(
             scheduler.step()
 
             n_batch = images.size(0)
-            train_loss += loss.item() * n_batch
+            train_loss     += traj_loss.item() * n_batch
+            train_det_loss += det_loss.item()  * n_batch
 
             m = _compute_traj_metrics(traj_pred.detach(), traj_gt.detach())
             for k in m:
@@ -301,8 +366,9 @@ def train(
 
             last_pred, last_gt = traj_pred.detach(), traj_gt.detach()
 
-        n_train_seen = max(len(train_ds), 1)
-        train_loss   /= n_train_seen
+        n_train_seen    = max(len(train_ds), 1)
+        train_loss     /= n_train_seen
+        train_det_loss /= n_train_seen
         for k in train_metrics:
             train_metrics[k] /= n_train_seen
 
@@ -310,7 +376,8 @@ def train(
 
         # --- validate ---
         model.eval()
-        val_loss = 0.0
+        val_loss     = 0.0
+        val_det_loss = 0.0
         val_metrics: dict[str, float] = {
             "ade": 0.0, "fde": 0.0, "loss_x": 0.0, "loss_y": 0.0,
             "max_lat_err": 0.0,
@@ -318,15 +385,19 @@ def train(
         val_pred_buf, val_gt_buf = None, None
 
         with torch.no_grad():
-            for images, state, traj_gt in val_loader:
-                images  = images.to(device)
-                state   = state.to(device)
-                traj_gt = traj_gt.to(device)
+            for images, state, traj_gt, actor_pos, actor_mask in val_loader:
+                images     = images.to(device)
+                state      = state.to(device)
+                traj_gt    = traj_gt.to(device)
+                actor_pos  = actor_pos.to(device)
+                actor_mask = actor_mask.to(device)
 
-                traj_pred = model(images, state)
-                loss      = loss_fn(traj_pred, traj_gt)
+                traj_pred, det_pred = model(images, state)
+                traj_loss = loss_fn(traj_pred, traj_gt)
+                det_loss  = _detection_loss(det_pred, actor_pos, actor_mask)
                 n_batch   = images.size(0)
-                val_loss += loss.item() * n_batch
+                val_loss     += traj_loss.item() * n_batch
+                val_det_loss += det_loss.item()  * n_batch
 
                 m = _compute_traj_metrics(traj_pred, traj_gt)
                 for k in m:
@@ -336,8 +407,9 @@ def train(
                     val_pred_buf = traj_pred
                     val_gt_buf   = traj_gt
 
-        n_val_seen = max(len(val_ds), 1)
-        val_loss  /= n_val_seen
+        n_val_seen    = max(len(val_ds), 1)
+        val_loss     /= n_val_seen
+        val_det_loss /= n_val_seen
         for k in val_metrics:
             val_metrics[k] /= n_val_seen
 
@@ -351,6 +423,7 @@ def train(
         print(
             f"  Epoch {epoch + 1:3d}/{num_epochs}"
             f"  loss={train_loss:.4f}  val={val_loss:.4f}"
+            f"  det={train_det_loss:.4f}"
             f"  ADE={train_metrics['ade']:.3f}m  FDE={train_metrics['fde']:.3f}m"
             f"  lr={current_lr:.2e}"
         )
@@ -361,6 +434,7 @@ def train(
             "lr":    current_lr,
             # training
             "train/loss":        train_loss,
+            "train/det_loss":    train_det_loss,
             "train/loss_x":      train_metrics["loss_x"],
             "train/loss_y":      train_metrics["loss_y"],
             "train/ade":         train_metrics["ade"],
@@ -369,6 +443,7 @@ def train(
             "train/grad_norm":   train_metrics["grad_norm"],
             # validation
             "val/loss":          val_loss,
+            "val/det_loss":      val_det_loss,
             "val/loss_x":        val_metrics["loss_x"],
             "val/loss_y":        val_metrics["loss_y"],
             "val/ade":           val_metrics["ade"],
