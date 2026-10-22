@@ -34,16 +34,21 @@ from .dataset import VAL_FRAC, AlpaNetDataset
 _REPO_ROOT = find_alpasim_root()
 
 
-def _compute_traj_metrics(pred: torch.Tensor, gt: torch.Tensor) -> dict[str, float]:
-    """ADE, FDE, per-axis MAE and max lateral error for (B, T, 2) trajectories."""
+def _compute_traj_metrics(
+    pred: torch.Tensor, gt: torch.Tensor, valid: torch.Tensor
+) -> dict[str, float]:
+    """ADE, FDE, per-axis MAE and max lateral error over the valid waypoints of (B, T, 2)."""
+    w = valid.to(pred.dtype)
+    n = w.sum().clamp(min=1)
     diff = pred - gt
     l2 = diff.norm(dim=-1)
+    last = (valid * torch.arange(valid.shape[1], device=valid.device)).argmax(dim=1)
     return {
-        "ade":         l2.mean().item(),
-        "fde":         l2[:, -1].mean().item(),
-        "loss_x":      diff[..., 0].abs().mean().item(),
-        "loss_y":      diff[..., 1].abs().mean().item(),
-        "max_lat_err": diff[..., 1].abs().max().item(),
+        "ade":         ((l2 * w).sum() / n).item(),
+        "fde":         l2[torch.arange(len(l2), device=l2.device), last].mean().item(),
+        "loss_x":      ((diff[..., 0].abs() * w).sum() / n).item(),
+        "loss_y":      ((diff[..., 1].abs() * w).sum() / n).item(),
+        "max_lat_err": (diff[..., 1].abs() * w).max().item(),
     }
 
 
@@ -191,15 +196,15 @@ def train(
             "ade": 0.0, "fde": 0.0, "loss_x": 0.0, "loss_y": 0.0,
             "max_lat_err": 0.0, "grad_norm": 0.0,
         }
-        last_pred, last_gt = None, None
 
-        for images, state, traj_gt in train_loader:
+        for images, state, traj_gt, valid in train_loader:
             images  = images.to(device)
             state   = state.to(device)
             traj_gt = traj_gt.to(device)
+            valid   = valid.to(device)
 
             traj_pred, hyps = model(images, state)
-            loss = winner_takes_all_loss(hyps, traj_gt)
+            loss = winner_takes_all_loss(hyps, traj_gt, valid)
 
             optim.zero_grad()
             loss.backward()
@@ -210,12 +215,10 @@ def train(
             n_batch = images.size(0)
             train_loss += loss.item() * n_batch
 
-            m = _compute_traj_metrics(traj_pred.detach(), traj_gt.detach())
+            m = _compute_traj_metrics(traj_pred.detach(), traj_gt.detach(), valid)
             for k in m:
                 train_metrics[k] += m[k] * n_batch
             train_metrics["grad_norm"] += grad_norm * n_batch
-
-            last_pred, last_gt = traj_pred.detach(), traj_gt.detach()
 
         n_seen = max(n_train, 1)
         train_loss /= n_seen
@@ -231,17 +234,18 @@ def train(
         val_pred_buf, val_gt_buf = None, None
 
         with torch.no_grad():
-            for images, state, traj_gt in val_loader:
+            for images, state, traj_gt, valid in val_loader:
                 images  = images.to(device)
                 state   = state.to(device)
                 traj_gt = traj_gt.to(device)
+                valid   = valid.to(device)
 
                 traj_pred, hyps = model(images, state)
-                loss = winner_takes_all_loss(hyps, traj_gt)
+                loss = winner_takes_all_loss(hyps, traj_gt, valid)
                 n_batch = images.size(0)
                 val_loss += loss.item() * n_batch
 
-                m = _compute_traj_metrics(traj_pred, traj_gt)
+                m = _compute_traj_metrics(traj_pred, traj_gt, valid)
                 for k in m:
                     val_metrics[k] += m[k] * n_batch
 

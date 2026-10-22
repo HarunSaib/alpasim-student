@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-Extract (observation, teacher_trajectory) pairs from AlpaSim .asl rollout logs.
+Extract (observation, teacher trajectory) pairs from AlpaSim .asl rollout logs.
 
 Usage:
     uv run python -m alpasim_student.dagger.collector <run_dir> <out_dir>
@@ -8,15 +8,22 @@ Usage:
 Output layout:
     <out_dir>/
       <rollout_uuid>/
-        samples.parquet      # one row per sim step that had a driver response
+        samples.parquet      # one row per driver decision step
         step_<ts>_imgs.npz   # {camera_id: HWC uint8 ndarray}
 
-Actual .asl entry kinds used:
+Label convention (label_version 2), matching how the driver turns a model's output into poses:
+    traj_xy   (40, 2)  teacher poses at +0.1 ... +4.0 s after the request, expressed in the ego
+                       frame at the request time (x forward, y left)
+    valid     (40,)    False where the teacher pose for that time step is missing
+    speed     m/s      from the latest ego dynamic state received before the request
+    accel     m/s^2    linear_acceleration.x of that same state (what the driver feeds the model)
+    yaw_rad, ego_x, ego_y   ego pose at the request (scene frame), kept for debugging
+
+.asl entry kinds used:
     driver_camera_image   – camera frame (camera_image.logical_id / image_bytes / frame_start_us)
-    driver_request        – ego step marker  (time_now_us)
-    driver_return         – teacher trajectory (trajectory.poses[].pose.vec.x/y)
-    actor_poses           – all actor world poses including EGO (timestamp_us / actor_id / pose)
-    rollout_metadata      – actor_definitions with labels per actor_id
+    driver_ego_trajectory – ego poses + dynamic states submitted to the driver
+    driver_request        – decision step marker (time_now_us)
+    driver_return         – teacher trajectory (current pose followed by future poses)
 """
 from __future__ import annotations
 
@@ -32,199 +39,141 @@ from PIL import Image
 
 from alpasim_utils.logs import async_read_pb_log
 
-# Actors beyond this range (metres, ego frame) are outside the model's useful
-# perception window and excluded from the detection supervision signal.
-_MAX_ACTOR_RANGE_M = 60.0
+from ..alpanet.alpanet_model import NUM_WAYPOINTS
+from ..alpanet.camera_utils import CAMERA_IDS
 
-# Maximum number of actor slots stored per step (closest actors by distance).
-_MAX_ACTORS = 8
-
-
-def _lookup_speed(speed_buffer: dict[int, float], ts: int) -> float:
-    """Return speed at ts by finding the nearest key in speed_buffer."""
-    if not speed_buffer:
-        return 0.0
-    closest = min(speed_buffer.keys(), key=lambda t: abs(t - ts))
-    return speed_buffer[closest]
+LABEL_VERSION = 2
+_STEP_US = 100_000       # 10 Hz
+_TIME_TOL_US = 10_000    # tolerance when matching a pose to its target time
+_REF_TOL_M = 0.05        # driver_return pose 0 must coincide with the ego pose at the request
 
 
-def _world_to_ego(
-    wx: float, wy: float,
-    ego_x: float, ego_y: float, ego_yaw: float,
-) -> tuple[float, float]:
-    """Transform a world-frame (wx, wy) point into ego BEV frame."""
-    dx, dy = wx - ego_x, wy - ego_y
+def _quat_to_yaw(q) -> float:
+    """Yaw about +Z; same formula as the driver service."""
+    return math.atan2(
+        2.0 * (q.w * q.z + q.x * q.y),
+        1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+    )
+
+
+def _teacher_targets(
+    poses,
+    ego_x: float,
+    ego_y: float,
+    ego_yaw: float,
+    t_req_us: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Teacher poses at +0.1 ... +4.0 s in the ego frame, plus a validity mask.
+
+    poses: iterable of (timestamp_us, x, y) in the scene frame.
+    """
     c, s = math.cos(ego_yaw), math.sin(ego_yaw)
-    return c * dx + s * dy, -s * dx + c * dy
-
-
-def _actors_in_ego_frame(
-    actor_poses_at_ts: list[tuple],
-    non_ego_ids: set[str],
-) -> list[list[float]]:
-    """Return [[x_ego, y_ego], ...] for non-EGO actors within range, closest first."""
-    ego_x = ego_y = ego_yaw = None
-    for actor_id, ax, ay, qz, qw in actor_poses_at_ts:
-        if actor_id == "EGO":
-            ego_x, ego_y = ax, ay
-            ego_yaw = 2.0 * math.atan2(qz, qw)
-            break
-
-    if ego_x is None:
-        return []
-
-    with_dist = []
-    for actor_id, ax, ay, _, _ in actor_poses_at_ts:
-        if actor_id not in non_ego_ids:
+    traj = np.zeros((NUM_WAYPOINTS, 2), dtype=np.float32)
+    valid = np.zeros(NUM_WAYPOINTS, dtype=bool)
+    for ts, x, y in poses:
+        k = round((ts - t_req_us) / _STEP_US)
+        if not 1 <= k <= NUM_WAYPOINTS:
             continue
-        x_rel, y_rel = _world_to_ego(ax, ay, ego_x, ego_y, ego_yaw)
-        dist = math.hypot(x_rel, y_rel)
-        if dist <= _MAX_ACTOR_RANGE_M:
-            with_dist.append((dist, x_rel, y_rel))
+        if abs(ts - t_req_us - k * _STEP_US) > _TIME_TOL_US:
+            continue
+        dx, dy = x - ego_x, y - ego_y
+        traj[k - 1] = (c * dx + s * dy, -s * dx + c * dy)
+        valid[k - 1] = True
+    return traj, valid
 
-    with_dist.sort()
-    return [[x, y] for _, x, y in with_dist[:_MAX_ACTORS]]
 
-
-async def _extract_rollout(asl_path: Path, out_dir: Path) -> int:
-    """Parse one .asl file and write samples to out_dir.  Returns sample count."""
+async def _extract_rollout(asl_path: Path, out_dir: Path) -> tuple[int, dict[str, int]]:
+    """Parse one .asl file and write samples to out_dir. Returns (sample count, skip counts)."""
     out_dir.mkdir(parents=True, exist_ok=True)
 
     records: list[dict] = []
+    skips = {"no_images": 0, "missing_camera": 0, "ref_mismatch": 0, "no_targets": 0}
 
     # image_buffer[frame_start_us][cam_id] = raw JPEG/PNG bytes
     image_buffer: dict[int, dict[str, bytes]] = {}
 
-    # Images selected for the current driver step
+    ego: dict | None = None          # latest ego pose + dynamic state received
+    request: dict | None = None      # snapshot taken at driver_request
     pending_images: dict[str, np.ndarray] = {}
-    current_ts: int = 0
-
-    # speed_buffer[timestamp_us] = speed_m_s from ego dynamic states
-    speed_buffer: dict[int, float] = {}
-
-    # actor_poses_buffer[timestamp_us] = [(actor_id, x, y, qz, qw), ...]
-    actor_poses_buffer: dict[int, list[tuple]] = {}
-
-    # non-EGO actor ids discovered from rollout_metadata.actor_definitions
-    non_ego_ids: set[str] = set()
 
     async for entry in async_read_pb_log(str(asl_path)):
         kind = entry.WhichOneof("log_entry")
 
-        # ------------------------------------------------------------------ #
-        # Rollout metadata: collect non-EGO actor ids and labels             #
-        # ------------------------------------------------------------------ #
-        if kind == "rollout_metadata":
-            for aabb in entry.rollout_metadata.actor_definitions.actor_aabb:
-                if aabb.actor_id != "EGO":
-                    non_ego_ids.add(aabb.actor_id)
-
-        # ------------------------------------------------------------------ #
-        # Actor world poses (all agents including EGO) at each sim step      #
-        # ------------------------------------------------------------------ #
-        elif kind == "actor_poses":
-            ap = entry.actor_poses
-            ts = int(ap.timestamp_us)
-            actor_poses_buffer[ts] = [
-                (
-                    p.actor_id,
-                    float(p.actor_pose.vec.x),
-                    float(p.actor_pose.vec.y),
-                    float(p.actor_pose.quat.z),
-                    float(p.actor_pose.quat.w),
-                )
-                for p in ap.actor_poses
-            ]
-
-        # ------------------------------------------------------------------ #
-        # Accumulate rendered camera images keyed by their frame timestamp    #
-        # ------------------------------------------------------------------ #
-        elif kind == "driver_camera_image":
+        if kind == "driver_camera_image":
             ci = entry.driver_camera_image.camera_image
-            ts = int(ci.frame_start_us)
-            cam_id = ci.logical_id
-            if ts not in image_buffer:
-                image_buffer[ts] = {}
-            image_buffer[ts][cam_id] = bytes(ci.image_bytes)
+            image_buffer.setdefault(int(ci.frame_start_us), {})[ci.logical_id] = bytes(ci.image_bytes)
 
-        # ------------------------------------------------------------------ #
-        # Ego dynamic states: extract speed at each pose timestamp            #
-        # ------------------------------------------------------------------ #
         elif kind == "driver_ego_trajectory":
-            ego_traj = entry.driver_ego_trajectory
-            for pose, dyn in zip(ego_traj.trajectory.poses, ego_traj.dynamic_states):
-                ts = int(pose.timestamp_us)
-                vx = dyn.linear_velocity.x
-                vy = dyn.linear_velocity.y
-                speed_buffer[ts] = float((vx ** 2 + vy ** 2) ** 0.5)
+            et = entry.driver_ego_trajectory
+            poses, states = list(et.trajectory.poses), list(et.dynamic_states)
+            if poses and states:
+                last, dyn = poses[-1], states[-1]
+                ego = {
+                    "x": float(last.pose.vec.x),
+                    "y": float(last.pose.vec.y),
+                    "yaw": _quat_to_yaw(last.pose.quat),
+                    "speed": float(math.hypot(dyn.linear_velocity.x, dyn.linear_velocity.y)),
+                    "accel": float(dyn.linear_acceleration.x),
+                }
 
-        # ------------------------------------------------------------------ #
-        # driver_request marks the start of a new decision step               #
-        # Pick the camera frame whose timestamp is closest (≤) time_now_us    #
-        # ------------------------------------------------------------------ #
         elif kind == "driver_request":
-            req = entry.driver_request
-            current_ts = int(req.time_now_us)
-
-            # Find the most recent camera batch at or before current_ts
-            valid_ts = [t for t in image_buffer if t <= current_ts]
+            t_req = int(entry.driver_request.time_now_us)
+            valid_ts = [t for t in image_buffer if t <= t_req]
+            pending_images = {}
             if valid_ts:
-                best_ts = max(valid_ts)
-                pending_images = {}
-                for cam_id, raw in image_buffer[best_ts].items():
+                for cam_id, raw in image_buffer[max(valid_ts)].items():
                     try:
-                        img = np.array(Image.open(io.BytesIO(raw)))
-                        pending_images[cam_id] = img
+                        pending_images[cam_id] = np.array(Image.open(io.BytesIO(raw)))
                     except Exception:
                         pass
-            else:
-                pending_images = {}
+            request = {"t": t_req, "ego": dict(ego) if ego else None}
 
-        # ------------------------------------------------------------------ #
-        # driver_return contains the teacher's planned trajectory             #
-        # ------------------------------------------------------------------ #
         elif kind == "driver_return":
-            ret = entry.driver_return
-            poses = list(ret.trajectory.poses)
-            if not poses or not pending_images:
+            poses = list(entry.driver_return.trajectory.poses)
+            if not poses or request is None or request["ego"] is None:
+                continue
+            if not pending_images:
+                skips["no_images"] += 1
+                continue
+            if any(cam not in pending_images for cam in CAMERA_IDS):
+                skips["missing_camera"] += 1
                 continue
 
-            # Extract (x, y) world coordinates then convert to ego-relative.
-            # Slice to NUM_WAYPOINTS (40) to match the student model's output size.
-            # Teacher provides 65 poses (~6.4 s); we use the first 40 (4.0 s @ 10 Hz).
-            from alpasim_student.alpanet.alpanet_model import NUM_WAYPOINTS
-            poses = poses[:NUM_WAYPOINTS]
-            traj_world = [[float(p.pose.vec.x), float(p.pose.vec.y)] for p in poses]
-            x0, y0 = traj_world[0]
-            traj_xy = [[x - x0, y - y0] for x, y in traj_world]
+            e, t_req = request["ego"], request["t"]
+            if math.hypot(poses[0].pose.vec.x - e["x"], poses[0].pose.vec.y - e["y"]) > _REF_TOL_M:
+                skips["ref_mismatch"] += 1
+                continue
 
-            # Actor positions in ego BEV frame from the nearest logged actor_poses
-            # entry (within 200 ms of this decision step).
-            actor_positions_ego: list[list[float]] = []
-            if actor_poses_buffer and non_ego_ids:
-                best_ap_ts = min(actor_poses_buffer, key=lambda t: abs(t - current_ts))
-                if abs(best_ap_ts - current_ts) < 200_000:
-                    actor_positions_ego = _actors_in_ego_frame(
-                        actor_poses_buffer[best_ap_ts], non_ego_ids
-                    )
+            traj, valid = _teacher_targets(
+                [(int(p.timestamp_us), float(p.pose.vec.x), float(p.pose.vec.y)) for p in poses],
+                e["x"], e["y"], e["yaw"], t_req,
+            )
+            if not valid.any():
+                skips["no_targets"] += 1
+                continue
 
-            img_file = out_dir / f"step_{current_ts:015d}_imgs.npz"
-            np.savez_compressed(str(img_file), **pending_images)
-
+            img_file = out_dir / f"step_{t_req:015d}_imgs.npz"
+            np.savez_compressed(
+                str(img_file), **{cam: pending_images[cam] for cam in CAMERA_IDS}
+            )
             records.append({
-                "timestamp_us":        current_ts,
-                "traj_xy":             traj_xy,
-                "speed":               _lookup_speed(speed_buffer, current_ts),
-                "img_file":            str(img_file),
-                "actor_positions_ego": actor_positions_ego,
+                "timestamp_us":  t_req,
+                "traj_xy":       traj.tolist(),
+                "valid":         valid.tolist(),
+                "speed":         e["speed"],
+                "accel":         e["accel"],
+                "yaw_rad":       e["yaw"],
+                "ego_x":         e["x"],
+                "ego_y":         e["y"],
+                "img_file":      str(img_file),
+                "label_version": LABEL_VERSION,
             })
-
             pending_images = {}   # consume; next step needs new images
 
     if records:
         pd.DataFrame(records).to_parquet(out_dir / "samples.parquet", index=False)
 
-    return len(records)
+    return len(records), skips
 
 
 def collect_from_run(run_dir: Path, out_dir: Path) -> int:
@@ -239,9 +188,9 @@ def collect_from_run(run_dir: Path, out_dir: Path) -> int:
 
     for asl_file in asl_files:
         rollout_id = asl_file.parent.name
-        rollout_out = out_dir / rollout_id
-        n = asyncio.run(_extract_rollout(asl_file, rollout_out))
-        print(f"  {rollout_id}: {n} samples")
+        n, skips = asyncio.run(_extract_rollout(asl_file, out_dir / rollout_id))
+        skipped = {k: v for k, v in skips.items() if v}
+        print(f"  {rollout_id}: {n} samples" + (f"  skipped {skipped}" if skipped else ""))
         total += n
 
     print(f"[collector] Total: {total} samples → {out_dir}")

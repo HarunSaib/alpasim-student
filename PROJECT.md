@@ -91,9 +91,20 @@ is busy (`ALPASIM_SKIP_GPU_CHECK=1` overrides).
 ## Data format
 
 `collector.py` reads each `rollout.asl` and writes `<dataset>/<rollout_id>/samples.parquet` plus
-`step_*_imgs.npz` (4 camera frames). Each row is one decision step: timestamp, speed, 40 teacher
-waypoints (`traj_xy`) and the image file. In the pinned simulator, `driver_return` poses are in the
-scene frame, pose 0 is the current time and spacing is 100 ms.
+`step_*_imgs.npz` (4 camera frames). Each row is one decision step (`label_version` 2):
+
+- `traj_xy` (40, 2): teacher poses at +0.1 … +4.0 s, in the ego frame at the request (x forward,
+  y left). In the pinned simulator `driver_return` poses are in the scene frame with the current pose
+  first, so the collector drops pose 0, matches the rest by timestamp and rotates by the ego yaw. This
+  is the exact inverse of the driver's rig-to-scene conversion.
+- `valid` (40,): False where a target pose is missing; the loss and metrics ignore those waypoints.
+- `speed`, `accel`: the latest ego dynamic state received before the request, which is what the
+  driver feeds the model at inference.
+- `yaw_rad`, `ego_x`, `ego_y`: ego pose at the request, for debugging and overlays.
+
+The dataset loader refuses data written without `label_version` 2; regenerate it with
+`python -m alpasim_student.dagger.collector <run_dir> <out_dir>`. `tests/test_labels.py` covers the
+label geometry and the masked loss.
 
 ---
 
@@ -116,10 +127,6 @@ scene frame, pose 0 is the current time and spacing is 100 ms.
 
 ## Known issues
 
-- Teacher trajectories are translated to the first pose but not rotated into the ego heading.
-- The first pose is the current time, so the 40 stored waypoints cover 0–3.9 s with a constant first
-  point.
-- Acceleration is 0.0 in training but live at inference.
 - WTA trains whichever hypothesis wins, but hypothesis 0 is executed and reported.
 - No same-state teacher labelling of student-visited states.
 - Validation split is by frame and changes as data grows.

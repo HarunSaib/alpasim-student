@@ -2,7 +2,6 @@
 """Training dataset: (camera frames, state, teacher trajectory) from collector output."""
 from __future__ import annotations
 
-import ast
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +12,7 @@ from torch.utils.data import Dataset
 
 from ..alpanet.alpanet_model import IMG_H, IMG_W, NUM_WAYPOINTS
 from ..alpanet.camera_utils import CAMERA_IDS
+from .collector import LABEL_VERSION
 
 VAL_FRAC = 0.1
 
@@ -30,7 +30,13 @@ class AlpaNetDataset(Dataset):
     def __init__(self, data_dir: Path):
         self.records: list[pd.Series] = []
         for pq in sorted(Path(data_dir).glob("*/samples.parquet")):
-            for _, row in pd.read_parquet(pq).iterrows():
+            df = pd.read_parquet(pq)
+            if "label_version" not in df.columns or (df["label_version"] != LABEL_VERSION).any():
+                raise ValueError(
+                    f"{pq} was not written with label_version {LABEL_VERSION}; "
+                    "regenerate it with alpasim_student.dagger.collector."
+                )
+            for _, row in df.iterrows():
                 self.records.append(row)
 
     def __len__(self) -> int:
@@ -47,16 +53,10 @@ class AlpaNetDataset(Dataset):
             imgs.append(_TRANSFORM(npz[cam_id]))
         images = torch.stack(imgs, dim=0)   # (N_cam, 3, H, W)
 
-        traj_raw = row["traj_xy"]
-        if isinstance(traj_raw, str):
-            traj_raw = ast.literal_eval(traj_raw)
-        traj = torch.from_numpy(np.vstack(traj_raw).astype(np.float32))  # (T_teacher, 2)
+        traj = torch.from_numpy(np.vstack(row["traj_xy"]).astype(np.float32))   # (40, 2)
+        valid = torch.from_numpy(np.asarray(row["valid"], dtype=bool))          # (40,)
+        if traj.shape != (NUM_WAYPOINTS, 2) or valid.shape != (NUM_WAYPOINTS,):
+            raise ValueError(f"bad label shape {tuple(traj.shape)} in {row['img_file']}")
 
-        if traj.shape[0] >= NUM_WAYPOINTS:
-            traj = traj[:NUM_WAYPOINTS]
-        else:
-            pad = traj[-1:].expand(NUM_WAYPOINTS - traj.shape[0], -1)
-            traj = torch.cat([traj, pad], dim=0)
-
-        state = torch.tensor([float(row.get("speed", 0.0)), 0.0], dtype=torch.float32)
-        return images, state, traj
+        state = torch.tensor([float(row["speed"]), float(row["accel"])], dtype=torch.float32)
+        return images, state, traj, valid

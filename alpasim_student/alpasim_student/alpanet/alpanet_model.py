@@ -129,7 +129,9 @@ class AlpaNet(nn.Module):
 
 # ── Training utilities ────────────────────────────────────────────────────────
 
-def winner_takes_all_loss(hyps: torch.Tensor, traj_gt: torch.Tensor) -> torch.Tensor:
+def winner_takes_all_loss(
+    hyps: torch.Tensor, traj_gt: torch.Tensor, valid: torch.Tensor | None = None
+) -> torch.Tensor:
     """Winner-takes-all L1 loss across multiple trajectory hypotheses.
 
     For each sample, selects the hypothesis with minimum L1 distance to GT and
@@ -139,16 +141,20 @@ def winner_takes_all_loss(hyps: torch.Tensor, traj_gt: torch.Tensor) -> torch.Te
     Args:
         hyps:    (B, M, T, 2) — predicted hypotheses
         traj_gt: (B, T, 2)    — teacher trajectory
+        valid:   (B, T) bool  — waypoints that have a teacher label (default: all)
     Returns:
         scalar loss
     """
     B, M, T, _ = hyps.shape
+    if valid is None:
+        valid = torch.ones(B, T, dtype=torch.bool, device=hyps.device)
 
-    gt_expanded = traj_gt.unsqueeze(1).expand_as(hyps)       # (B, M, T, 2)
-    per_hyp_l1  = (hyps - gt_expanded).abs().mean(dim=(-2, -1))  # (B, M)
+    weight = valid[:, None, :, None].to(hyps.dtype)                 # (B, 1, T, 1)
+    err = (hyps - traj_gt.unsqueeze(1)).abs() * weight              # (B, M, T, 2)
+    denom = (valid.sum(dim=1).clamp(min=1) * 2).to(hyps.dtype)      # (B,)
+    per_hyp_l1 = err.sum(dim=(-2, -1)) / denom[:, None]             # (B, M)
 
     with torch.no_grad():
-        winner_idx = per_hyp_l1.argmin(dim=1)                # (B,)
+        winner_idx = per_hyp_l1.argmin(dim=1)                       # (B,)
 
-    winner_hyps = hyps[torch.arange(B, device=hyps.device), winner_idx]  # (B, T, 2)
-    return (winner_hyps - traj_gt).abs().mean()
+    return per_hyp_l1[torch.arange(B, device=hyps.device), winner_idx].mean()
