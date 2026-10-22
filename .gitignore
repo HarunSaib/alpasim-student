@@ -4,5 +4,7 @@ __pycache__/
 *.pth
 *.pyc
 dagger_run*/
+alpanet_dagger_*/
 wandb/
 outputs/
+.env

@@ -1,27 +1,33 @@
 #!/usr/bin/env bash
-# sync.sh — Pull latest code from GitHub and copy into the alpasim repo.
-# Run this on the server after pushing changes from your Windows machine.
+# sync.sh — Pull latest code from GitHub and deploy the plugin into an AlpaSim checkout.
 #
 # Usage:
-#   cd /home/harun/alpasim-student
-#   ./sync.sh
+#   ./sync.sh                                   # deploys into $ALPASIM_ROOT (default /home/harun/alpasim)
+#   ALPASIM_ROOT=$PWD/third_party/alpasim ./sync.sh   # deploy into the pinned submodule instead
 
-set -e
+set -euo pipefail
 
-STUDENT_REPO="/home/harun/alpasim-student"
-ALPASIM_ROOT="/home/harun/alpasim"
+STUDENT_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ALPASIM_ROOT="${ALPASIM_ROOT:-/home/harun/alpasim}"
 
 echo "[sync] Pushing and pulling from GitHub..."
 cd "$STUDENT_REPO"
 git push
-git pull
+git pull --ff-only
+echo "[sync] Simulator pin: $(git ls-tree HEAD third_party/alpasim | awk '{print $3}')"
 
-echo "[sync] Copying plugin into alpasim..."
-cp -r "$STUDENT_REPO/alpasim_student" "$ALPASIM_ROOT/plugins/"
+echo "[sync] Deploying plugin into $ALPASIM_ROOT/plugins/alpasim_student ..."
+mkdir -p "$ALPASIM_ROOT/plugins/alpasim_student"
+rsync -a --delete --exclude __pycache__ \
+  "$STUDENT_REPO/alpasim_student/" "$ALPASIM_ROOT/plugins/alpasim_student/"
 
 echo "[sync] Copying topology config..."
 cp "$STUDENT_REPO/topology/2gpu_alpamayo.yaml" \
    "$ALPASIM_ROOT/src/wizard/configs/topology/2gpu_alpamayo.yaml"
+
+echo "[sync] Copying scripts..."
+mkdir -p "$ALPASIM_ROOT/scripts"
+cp "$STUDENT_REPO"/scripts/*.py "$ALPASIM_ROOT/scripts/"
 
 echo "[sync] Syncing all workspace packages into venv..."
 cd "$ALPASIM_ROOT"
