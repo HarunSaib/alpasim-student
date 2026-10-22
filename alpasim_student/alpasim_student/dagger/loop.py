@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -18,6 +19,15 @@ from pathlib import Path
 
 import pandas as pd
 
+from ..guard import (
+    GpuMemoryExceeded,
+    GpuPeakSampler,
+    SimulationFailed,
+    compose_states,
+    failed_runtime,
+    log_shows_oom,
+    read_gpu_memory,
+)
 from ..paths import find_alpasim_root
 from ..splits import TRAIN_SCENE_IDS, VAL_SCENE_IDS
 
@@ -223,16 +233,11 @@ def _check_gpus_free(gpu_ids: set[str], max_used_mib: int = 2048) -> None:
     """Fail fast if a GPU the topology needs is already in use by another process."""
     if os.environ.get("ALPASIM_SKIP_GPU_CHECK") == "1":
         return
-    out = subprocess.run(
-        ["nvidia-smi", "--query-gpu=index,memory.used,memory.total",
-         "--format=csv,noheader,nounits"],
-        capture_output=True, text=True, check=True,
-    ).stdout
-    busy = []
-    for line in out.strip().splitlines():
-        idx, used, total = (field.strip() for field in line.split(","))
-        if idx in gpu_ids and int(used) > max_used_mib:
-            busy.append(f"GPU {idx}: {used}/{total} MiB in use")
+    busy = [
+        f"GPU {idx}: {used}/{total} MiB in use"
+        for idx, (used, total) in read_gpu_memory().items()
+        if idx in gpu_ids and used > max_used_mib
+    ]
     if busy:
         raise RuntimeError(
             "GPUs required by the topology are not free: " + "; ".join(busy)
@@ -256,18 +261,43 @@ def _run_wizard(
     print("[loop] GPU placement: " + ", ".join(
         f"{svc}->{'+'.join(ids)}" for svc, ids in sorted(placement.items())
     ))
-    _check_gpus_free({g for ids in placement.values() for g in ids})
+    gpu_ids = {g for ids in placement.values() for g in ids}
+    _check_gpus_free(gpu_ids)
 
     run_cmd = ["docker", "compose", "-f", str(compose_file), "up"]
     print(f"[loop] $ {' '.join(run_cmd)}")
+    sampler = GpuPeakSampler(gpu_ids).start()
+    failure = None
     try:
         result = subprocess.run(run_cmd, cwd=log_dir, env=env)
-        if result.returncode != 0:
-            raise RuntimeError(f"docker compose up exited with code {result.returncode}")
+        failed = failed_runtime(compose_states(compose_file, env))
+        if result.returncode != 0 or failed:
+            failure = (result.returncode, failed)
     finally:
+        peaks = sampler.stop()
+        (log_dir / "gpu_peak.json").write_text(json.dumps(peaks, indent=2))
+        print("[loop] GPU peak used / total MiB: " + ", ".join(
+            f"GPU {g} {peaks['peak_used_mib'][g]}/{peaks['total_mib'][g]} "
+            f"(was {peaks['first_used_mib'][g]} before the run)"
+            for g in sorted(peaks["peak_used_mib"])
+        ))
+        # `compose down` deletes the containers and their logs, so save them first.
+        with open(log_dir / "compose.log", "w") as log_file:
+            subprocess.run(
+                ["docker", "compose", "-f", str(compose_file), "logs", "--no-color"],
+                cwd=log_dir, env=env, stdout=log_file, stderr=subprocess.STDOUT, check=False,
+            )
         subprocess.run(
             ["docker", "compose", "-f", str(compose_file), "down", "--remove-orphans"],
             cwd=log_dir, env=env, check=False,
+        )
+    if failure:
+        code, failed = failure
+        log_text = (log_dir / "compose.log").read_text(errors="ignore")
+        error = GpuMemoryExceeded if log_shows_oom(log_text) else SimulationFailed
+        raise error(
+            f"simulation failed (compose exit {code}, runtime exit codes {failed}); "
+            f"logs saved to {log_dir / 'compose.log'}"
         )
 
 
@@ -432,15 +462,6 @@ def run_dagger(
     # Pre-create checkpoints dir as harun so Docker (root) can't steal ownership
     (base_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
 
-    # Fixed validation data: the teacher drives the held-out scenes once; never used for training.
-    val_dataset = base_dir / "val_dataset"
-    if not any(val_dataset.rglob("samples.parquet")):
-        print("\n[loop] Collecting fixed validation data with the teacher on held-out scenes...")
-        val_run = base_dir / "val_teacher_run"
-        _run_wizard("alpamayo1_5", val_run, base_dir=base_dir, scene_ids=list(VAL_SCENE_IDS))
-        if collect_from_run(val_run, val_dataset) == 0:
-            raise RuntimeError(f"no validation samples collected; check the logs in {val_run}")
-
     def _loop_log(data: dict) -> None:
         """Log to W&B, reinitialising the loop run if train() closed it."""
         if wandb_mode != "online":
@@ -462,6 +483,38 @@ def run_dagger(
         """Re-open the loop-level W&B run after train() closed it."""
         _loop_log({})  # no-op log just to ensure run is open
 
+    current_iteration = start_iteration
+
+    def _abort(phase: str, error: Exception) -> None:
+        """Report a failed simulation phase and how to resume; the caller re-raises."""
+        ckpt = f" --initial-checkpoint {student_ckpt}" if student_ckpt else ""
+        print(
+            f"\n[loop] ABORTING during {phase}: {error}\n"
+            "[loop] Data, checkpoints and the failed run's logs are kept. Resume with:\n"
+            f"  uv run --extra all --no-sync python -m alpasim_student.dagger.loop "
+            f"--base-dir {base_dir} --start-iteration {current_iteration}{ckpt}",
+            flush=True,
+        )
+        _loop_log({"dagger/aborted": True, "dagger/abort_phase": phase})
+
+    def _sim(phase: str, *args, **kwargs) -> None:
+        """Run one simulation phase; on failure print the resume command and stop the loop."""
+        try:
+            _run_wizard(*args, **kwargs)
+        except SimulationFailed as error:
+            _abort(phase, error)
+            raise
+
+    # Fixed validation data: the teacher drives the held-out scenes once; never used for training.
+    val_dataset = base_dir / "val_dataset"
+    if not any(val_dataset.rglob("samples.parquet")):
+        print("\n[loop] Collecting fixed validation data with the teacher on held-out scenes...")
+        val_run = base_dir / "val_teacher_run"
+        _sim("validation data collection", "alpamayo1_5", val_run, base_dir=base_dir,
+             scene_ids=list(VAL_SCENE_IDS))
+        if collect_from_run(val_run, val_dataset) == 0:
+            raise RuntimeError(f"no validation samples collected; check the logs in {val_run}")
+
     pass_rate_history: list[float] = []
     _curriculum_n_scenes: int = 0   # tracks scene count; reset history on expansion
 
@@ -473,6 +526,7 @@ def run_dagger(
             print(f"[loop] Seeded dataset from iter_{i}: {candidate}")
 
     for iteration in range(start_iteration, n_iterations):
+        current_iteration = iteration
         print(f"\n{'='*60}")
         print(f"  DAgger  iteration {iteration + 1}/{n_iterations}")
         print(f"{'='*60}")
@@ -498,7 +552,8 @@ def run_dagger(
         if iteration == 0 or student_ckpt is None:
             print("\n[loop] Phase 1: bootstrapping with Alpamayo 1.5 teacher...")
             teacher_run = iter_dir / "teacher_run"
-            _run_wizard("alpamayo1_5", teacher_run, base_dir=base_dir, scene_ids=iter_teacher_scene_ids)
+            _sim("teacher bootstrap", "alpamayo1_5", teacher_run, base_dir=base_dir,
+                 scene_ids=iter_teacher_scene_ids)
             _loop_log(_build_eval_log(teacher_run, iteration, "teacher"))
             source_run = teacher_run
 
@@ -509,7 +564,8 @@ def run_dagger(
             # Update driver yaml checkpoint path before launching
             _patch_checkpoint(student_ckpt)
             # Use 2gpu_alpamayo topology (has all required config fields)
-            _run_wizard(MODEL, student_run, topology="2gpu_alpamayo", base_dir=base_dir, scene_ids=iter_scene_ids)
+            _sim("student run", MODEL, student_run, topology="2gpu_alpamayo", base_dir=base_dir,
+                 scene_ids=iter_scene_ids)
 
             # Log student eval metrics to W&B
             _loop_log(_build_eval_log(student_run, iteration, "student"))
@@ -519,7 +575,9 @@ def run_dagger(
             metrics_files = list(student_run.glob("rollouts/*/*/metrics.parquet")) if student_run.exists() else []
             n_completed = len(metrics_files)
             if n_completed == 0:
-                print("[loop] WARNING: 0 completed rollouts — simulation may have crashed. Running teacher corrections.")
+                error = SimulationFailed(f"student run completed 0 rollouts; see {student_run}")
+                _abort("student run", error)
+                raise error
             else:
                 failed = _detect_failures(student_run)
                 pass_rate = (n_completed - len(failed)) / n_completed
@@ -545,7 +603,8 @@ def run_dagger(
 
             print("[loop] Phase 1b: querying teacher for corrections on failed scenes...")
             correction_run = iter_dir / "teacher_correction_run"
-            _run_wizard("alpamayo1_5", correction_run, base_dir=base_dir, scene_ids=iter_teacher_scene_ids)
+            _sim("teacher run", "alpamayo1_5", correction_run, base_dir=base_dir,
+                 scene_ids=iter_teacher_scene_ids)
             _loop_log(_build_eval_log(correction_run, iteration, "teacher_correction"))
             source_run = correction_run
 

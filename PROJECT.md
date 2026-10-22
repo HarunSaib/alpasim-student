@@ -92,8 +92,21 @@ iterations 1..N:  student drives the curriculum scenes → pass rate / failure c
   validation ADE of hypothesis 0.
 - Checkpoints: `<base-dir>/checkpoints/alpanet_iter_N.pth` and `_best.pth`.
 
-GPU placement is read from the topology; the loop prints it and refuses to start if a required GPU
-is busy (`ALPASIM_SKIP_GPU_CHECK=1` overrides).
+### Failure handling
+
+GPU placement is read from the topology. Around every simulation run (`guard.py`, `_run_wizard`):
+
+- **Before:** the loop prints the placement and refuses to start if a required GPU already has more
+  than 2 GiB in use (`ALPASIM_SKIP_GPU_CHECK=1` overrides).
+- **During:** a sampler records each GPU's memory (first reading, peak, lowest free) and warns when a
+  GPU is within 512 MiB of full. It only observes: a PyTorch process can legitimately cache most of a
+  GPU, so low free memory alone is not a failure.
+- **After:** `docker compose up` exits 0 even when a container crashed, so the runtime container's
+  exit code is checked. A non-zero exit raises `SimulationFailed`, or `GpuMemoryExceeded` when the logs
+  show an out-of-memory error. The container logs are saved to `<run>/compose.log` before
+  `compose down` removes them, and the GPU numbers go to `<run>/gpu_peak.json`.
+- **Loop:** a failed phase, or a student run with zero completed rollouts, stops the loop and prints
+  the exact command to resume from the failed iteration. Data and checkpoints so far are kept.
 
 ---
 
