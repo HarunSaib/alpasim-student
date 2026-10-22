@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-AlpaNet DAgger trainer.
+AlpaNet trainer.
 
-Shares the AlpaSimDataset and weighted-sampler logic from trainer.py but uses
-winner-takes-all multi-hypothesis loss and a larger batch/LR schedule tuned for
-AlpaNet's BEV encoder.
+Trains on teacher data from the training scenes and validates on a fixed set of
+held-out scenes (see splits.py). Uses a winner-takes-all L1 loss (plain L1 when
+there is a single hypothesis) and a weighted sampler that favours newer iterations.
 
 Usage:
     uv run python -m alpasim_student.dagger.alpanet_trainer \
         --data ./dataset/iter_0 [./dataset/iter_1 ...] \
+        --val-data ./val_dataset \
         --out  ./checkpoints/alpanet_iter1.pth \
-        [--epochs 30] [--batch 8] [--lr 3e-4] [--device cuda:0]
+        [--epochs 30] [--batch 8] [--lr 3e-4] [--device cuda:0] [--hypotheses 1]
 """
 from __future__ import annotations
 
@@ -24,12 +25,13 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import wandb
-from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler, random_split
+from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler
 
 from ..alpanet.alpanet_model import AlpaNet, N_HYPOTHESES, winner_takes_all_loss
 from ..alpanet.camera_utils import load_cam_params
 from ..paths import find_alpasim_root
-from .dataset import VAL_FRAC, AlpaNetDataset
+from ..splits import TRAIN_SCENE_IDS, VAL_SCENE_IDS
+from .dataset import AlpaNetDataset
 
 _REPO_ROOT = find_alpasim_root()
 
@@ -73,6 +75,7 @@ def _traj_figure(pred: torch.Tensor, gt: torch.Tensor, n: int = 6) -> "plt.Figur
 
 def train(
     data_dirs: list[Path],
+    val_dirs: list[Path],
     checkpoint_out: Path,
     num_epochs: int = 30,
     batch_size: int = 8,
@@ -81,6 +84,7 @@ def train(
     device_str: str = "cuda:0",
     resume_from: str | None = None,
     dagger_iter: int = 0,
+    n_hypotheses: int = N_HYPOTHESES,
 ) -> None:
     os.chdir(_REPO_ROOT)
 
@@ -96,15 +100,13 @@ def train(
     # ------------------------------------------------------------------ #
     # Dataset                                                              #
     # ------------------------------------------------------------------ #
-    datasets = [AlpaNetDataset(d) for d in data_dirs]
-    full_dataset = ConcatDataset(datasets)
-    n_total = len(full_dataset)
-    n_val   = max(1, int(n_total * VAL_FRAC)) if n_total > 1 else 0
-    n_train = n_total - n_val
-    train_ds, val_ds = random_split(
-        full_dataset, [n_train, n_val],
-        generator=torch.Generator().manual_seed(42),
-    )
+    datasets = [AlpaNetDataset(d, TRAIN_SCENE_IDS) for d in data_dirs]
+    train_ds = ConcatDataset(datasets)
+    val_ds = ConcatDataset([AlpaNetDataset(d, VAL_SCENE_IDS) for d in val_dirs])
+    n_train, n_val = len(train_ds), len(val_ds)
+    n_total = n_train + n_val
+    if n_train == 0 or n_val == 0:
+        raise ValueError(f"need training and validation samples, got train={n_train} val={n_val}")
 
     samples_per_iter = {f"iter_{i}": len(ds) for i, ds in enumerate(datasets)}
 
@@ -120,7 +122,7 @@ def train(
             "lr":            lr,
             "weight_decay":  weight_decay,
             "dagger_iter":   dagger_iter,
-            "n_hypotheses":  N_HYPOTHESES,
+            "n_hypotheses":  n_hypotheses,
             "total_samples": n_total,
             "train_samples": n_train,
             "val_samples":   n_val,
@@ -131,14 +133,9 @@ def train(
     print(f"[alpanet_trainer] {n_total} samples, train={n_train}, val={n_val}, epochs={num_epochs}")
 
     # Weighted sampler: recent iterations 2× weight
-    sample_weights = []
-    for idx in train_ds.indices:
-        cumulative = 0
-        for iter_idx, ds in enumerate(datasets):
-            cumulative += len(ds)
-            if idx < cumulative:
-                sample_weights.append(1.0 + iter_idx / max(1, len(datasets) - 1))
-                break
+    sample_weights: list[float] = []
+    for iter_idx, ds in enumerate(datasets):
+        sample_weights += [1.0 + iter_idx / max(1, len(datasets) - 1)] * len(ds)
     sampler = WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
 
     train_loader = DataLoader(
@@ -165,7 +162,7 @@ def train(
         )
     cam_params = load_cam_params("", asl_path=asl_candidates[0])
 
-    model = AlpaNet(cam_params).to(device)
+    model = AlpaNet(cam_params, n_hypotheses=n_hypotheses).to(device)
     if resume_from and Path(resume_from).exists():
         missing, _ = model.load_state_dict(
             torch.load(resume_from, map_location=device, weights_only=True), strict=False
@@ -305,7 +302,9 @@ def train(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data",         nargs="+", required=True)
+    parser.add_argument("--val-data",     nargs="+", required=True)
     parser.add_argument("--out",          required=True)
+    parser.add_argument("--hypotheses",   type=int,   default=N_HYPOTHESES)
     parser.add_argument("--epochs",       type=int,   default=30)
     parser.add_argument("--batch",        type=int,   default=8)
     parser.add_argument("--lr",           type=float, default=1e-4)
@@ -317,6 +316,8 @@ if __name__ == "__main__":
 
     train(
         data_dirs      = [Path(d) for d in args.data],
+        val_dirs       = [Path(d) for d in args.val_data],
+        n_hypotheses   = args.hypotheses,
         checkpoint_out = Path(args.out),
         num_epochs     = args.epochs,
         batch_size     = args.batch,

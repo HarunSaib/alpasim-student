@@ -26,7 +26,7 @@ from alpasim_driver.models.base import (
 )
 from alpasim_driver.schema import ModelConfig
 
-from .alpanet_model import IMG_H, IMG_W, AlpaNet
+from .alpanet_model import IMG_H, IMG_W, N_HYPOTHESES, NUM_WAYPOINTS, AlpaNet
 from .camera_utils import CAMERA_IDS, load_cam_params
 
 logger = logging.getLogger(__name__)
@@ -69,10 +69,17 @@ class AlpaNetModel(BaseTrajectoryModel):
             cam_params = asyncio.run(_parse_cam_params_from_asl(asls[0]))
             logger.info("AlpaNetModel: loaded camera calibration from %s", asls[0])
 
-        self._net = AlpaNet(cam_params).to(device)
-
+        ckpt = None
         if checkpoint_path and Path(checkpoint_path).exists():
             ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
+        # The head count is a property of the checkpoint: its output layer holds K x 40 x 2 values.
+        n_hyp = (
+            ckpt["hyp_head.2.weight"].shape[0] // (NUM_WAYPOINTS * 2) if ckpt is not None
+            else N_HYPOTHESES
+        )
+        self._net = AlpaNet(cam_params, n_hypotheses=n_hyp).to(device)
+
+        if ckpt is not None:
             missing, unexpected = self._net.load_state_dict(ckpt, strict=False)
             if missing:
                 logger.info("Checkpoint missing keys (random init): %s", missing)

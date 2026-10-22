@@ -19,6 +19,7 @@ from pathlib import Path
 import pandas as pd
 
 from ..paths import find_alpasim_root
+from ..splits import TRAIN_SCENE_IDS, VAL_SCENE_IDS
 
 ALPASIM_ROOT = find_alpasim_root()
 MODEL = "alpanet"   # driver config name and checkpoint prefix
@@ -369,42 +370,17 @@ def _build_eval_log(run_dir: Path, iteration: int, phase: str) -> dict:
     return log
 
 
-# All available scenes ordered from simplest to most varied.
-ALL_SCENE_IDS = [
-    # --- core scenes (introduced early) ---
-    "clipgt-01d503d4-449b-46fc-8d78-9085e70d3554",   # Batch0005 — default, straightforward
-    "clipgt-a309e228-26e1-423e-a44c-cb00aa7378cb",   # Batch0005 — turning scene (persistent failure)
-    # --- diversity scenes (introduced mid-curriculum) ---
-    "clipgt-804afc4a-fd1e-4f58-bd39-a4c486a916e5",   # Batch0005 — mixed
-    "clipgt-1bccdc21-6e9c-425a-a0a1-392e2353f2b3",   # Batch0002 — different lighting/geometry
-    "clipgt-6e190b33-73c2-4958-8448-db999b871a78",   # Batch0010 — maximum diversity
-    # --- v3 additions: new batches for broader turn generalisation ---
-    "clipgt-04db1bb2-90fe-47a7-9d09-27d020c618d4",   # Batch0001 — unseen batch
-    "clipgt-e36cf4c2-03a0-4af2-9146-48a5372efb3d",   # Batch0007 — unseen batch
-    "clipgt-19f339ba-4f3a-4025-b774-4b271e639f2a",   # Batch0009 — unseen batch
-]
-
-# Curriculum: scene list expands as the model matures.
-# Iters 0-5:  2 scenes (core lane-keeping + turning)
-# Iters 6-11: 4 scenes (add lighting/geometry diversity)
-# Iters 12-17: 6 scenes (original full set + 1 new batch)
-# Iters 18+:  all 8 scenes (maximum diversity)
-CURRICULUM = [
-    (0,  ALL_SCENE_IDS[:2]),   # iters 0–5
-    (6,  ALL_SCENE_IDS[:4]),   # iters 6–11
-    (12, ALL_SCENE_IDS[:6]),   # iters 12–17
-    (18, ALL_SCENE_IDS),       # iters 18+
-]
+# Curriculum over the training scenes (splits.TRAIN_SCENE_IDS): iteration threshold → scene count.
+CURRICULUM = [(0, 2), (6, 4), (12, 6)]
 
 
 def _curriculum_scenes(iteration: int, scene_ids: list[str]) -> list[str]:
     """Return the scene list for this iteration based on the curriculum schedule."""
-    active = scene_ids
-    for threshold, scenes in CURRICULUM:
+    count = CURRICULUM[0][1]
+    for threshold, n_scenes in CURRICULUM:
         if iteration >= threshold:
-            # Map curriculum indices onto the caller-supplied scene list
-            active = scene_ids[:len(scenes)]
-    return active
+            count = n_scenes
+    return scene_ids[:count]
 
 
 def run_dagger(
@@ -428,6 +404,11 @@ def run_dagger(
     from .collector import collect_from_run
 
     base_dir = Path(base_dir)
+    scene_ids = list(scene_ids or TRAIN_SCENE_IDS)
+    teacher_scene_ids = list(teacher_scene_ids or TRAIN_SCENE_IDS[:2])
+    leaked = (set(scene_ids) | set(teacher_scene_ids)) & set(VAL_SCENE_IDS)
+    if leaked:
+        raise ValueError(f"validation scenes cannot be used for collection: {sorted(leaked)}")
     all_data_dirs: list[Path] = []
     student_ckpt: Path | None = initial_checkpoint
 
@@ -450,6 +431,15 @@ def run_dagger(
 
     # Pre-create checkpoints dir as harun so Docker (root) can't steal ownership
     (base_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+
+    # Fixed validation data: the teacher drives the held-out scenes once; never used for training.
+    val_dataset = base_dir / "val_dataset"
+    if not any(val_dataset.rglob("samples.parquet")):
+        print("\n[loop] Collecting fixed validation data with the teacher on held-out scenes...")
+        val_run = base_dir / "val_teacher_run"
+        _run_wizard("alpamayo1_5", val_run, base_dir=base_dir, scene_ids=list(VAL_SCENE_IDS))
+        if collect_from_run(val_run, val_dataset) == 0:
+            raise RuntimeError(f"no validation samples collected; check the logs in {val_run}")
 
     def _loop_log(data: dict) -> None:
         """Log to W&B, reinitialising the loop run if train() closed it."""
@@ -578,6 +568,7 @@ def run_dagger(
         print(f"\n[loop] Phase 3: training {MODEL} ({len(all_data_dirs)} dataset(s))...")
         train(
             data_dirs      = all_data_dirs,
+            val_dirs       = [val_dataset],
             checkpoint_out = ckpt_out,
             num_epochs     = epochs_per_iter,
             device_str     = "cuda:0",
@@ -631,8 +622,8 @@ if __name__ == "__main__":
     parser.add_argument("--initial-checkpoint", default=None,
                         help="Path to an existing student checkpoint to start from.")
     parser.add_argument("--scenes",             nargs="+",  default=None,
-                        help="Scene IDs to run (e.g. clipgt-01d503d4-... clipgt-a309e228-...). "
-                             "Defaults to the base config scene list (1 scene). "
+                        help="Training scene IDs for student runs. Defaults to splits.TRAIN_SCENE_IDS "
+                             "(the curriculum expands over them); validation scenes are rejected. "
                              "HF_TOKEN in .env is used to auto-download missing scenes.")
     args = parser.parse_args()
 
@@ -642,6 +633,5 @@ if __name__ == "__main__":
         epochs_per_iter     = args.epochs,
         start_iteration     = args.start_iteration,
         initial_checkpoint  = Path(args.initial_checkpoint) if args.initial_checkpoint else None,
-        scene_ids           = args.scenes or ALL_SCENE_IDS,
-        teacher_scene_ids   = ALL_SCENE_IDS[:2],
+        scene_ids           = args.scenes,
     )

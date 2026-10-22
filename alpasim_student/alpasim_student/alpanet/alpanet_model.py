@@ -35,8 +35,8 @@ from .camera_utils import CAMERA_IDS, CameraParams
 IMG_H = 270
 IMG_W = 480
 NUM_WAYPOINTS = 40      # 10 Hz × 4.0 s
-N_HYPOTHESES  = 4
-STATE_DIM     = 2       # speed (m/s), acceleration (m/s²)
+N_HYPOTHESES  = 1       # default head count; 1 is the single-trajectory baseline
+STATE_DIM    = 2       # speed (m/s), acceleration (m/s²)
 N_CAM         = len(CAMERA_IDS)
 _FEAT_STRIDE  = 8       # ResNet34 stride after layer2
 
@@ -52,8 +52,9 @@ def _conv_bn_relu(in_ch: int, out_ch: int, stride: int = 1) -> nn.Sequential:
 class AlpaNet(nn.Module):
     """AlpaNet core nn.Module — wraps backbone, BEV lifter, and all heads."""
 
-    def __init__(self, cam_params: dict[str, CameraParams]):
+    def __init__(self, cam_params: dict[str, CameraParams], n_hypotheses: int = N_HYPOTHESES):
         super().__init__()
+        self.n_hypotheses = n_hypotheses
 
         # ── Image backbone: ResNet34 up to layer2 ─────────────────────────────
         r34 = tvm.resnet34(weights=None)
@@ -91,7 +92,7 @@ class AlpaNet(nn.Module):
         self.hyp_head = nn.Sequential(
             nn.Linear(_fused_dim, 512),
             nn.ReLU(inplace=True),
-            nn.Linear(512, N_HYPOTHESES * NUM_WAYPOINTS * 2),
+            nn.Linear(512, n_hypotheses * NUM_WAYPOINTS * 2),
         )
 
     def forward(
@@ -121,7 +122,7 @@ class AlpaNet(nn.Module):
 
         # Multi-hypothesis output
         raw  = self.hyp_head(fused)                           # (B, M*T*2)
-        hyps = raw.view(B, N_HYPOTHESES, NUM_WAYPOINTS, 2)
+        hyps = raw.view(B, self.n_hypotheses, NUM_WAYPOINTS, 2)
         traj = hyps[:, 0]                                     # (B, T, 2) — default output
 
         return traj, hyps

@@ -2,6 +2,7 @@
 """Training dataset: (camera frames, state, teacher trajectory) from collector output."""
 from __future__ import annotations
 
+from collections.abc import Collection
 from pathlib import Path
 
 import numpy as np
@@ -14,8 +15,6 @@ from ..alpanet.alpanet_model import IMG_H, IMG_W, NUM_WAYPOINTS
 from ..alpanet.camera_utils import CAMERA_IDS
 from .collector import LABEL_VERSION
 
-VAL_FRAC = 0.1
-
 _TRANSFORM = T.Compose([
     T.ToImage(),                                   # numpy HWC uint8 → CHW tensor uint8
     T.Resize((IMG_H, IMG_W)),
@@ -27,7 +26,11 @@ _TRANSFORM = T.Compose([
 class AlpaNetDataset(Dataset):
     """Loads (images, state, trajectory) triples from a collector output directory."""
 
-    def __init__(self, data_dir: Path):
+    def __init__(self, data_dir: Path, scenes: Collection[str]):
+        """`scenes` is the set of scene ids this dataset may contain (the train or val split).
+
+        A sample from any other scene raises, so train and validation data cannot mix silently.
+        """
         self.records: list[pd.Series] = []
         for pq in sorted(Path(data_dir).glob("*/samples.parquet")):
             df = pd.read_parquet(pq)
@@ -36,6 +39,9 @@ class AlpaNetDataset(Dataset):
                     f"{pq} was not written with label_version {LABEL_VERSION}; "
                     "regenerate it with alpasim_student.dagger.collector."
                 )
+            foreign = sorted(set(df["scene_id"]) - set(scenes))
+            if foreign:
+                raise ValueError(f"{pq} contains scenes outside this split: {foreign}")
             for _, row in df.iterrows():
                 self.records.append(row)
 

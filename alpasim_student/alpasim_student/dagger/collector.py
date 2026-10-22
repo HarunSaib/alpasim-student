@@ -11,7 +11,8 @@ Output layout:
         samples.parquet      # one row per driver decision step
         step_<ts>_imgs.npz   # {camera_id: HWC uint8 ndarray}
 
-Label convention (label_version 2), matching how the driver turns a model's output into poses:
+Label convention (label_version 3), matching how the driver turns a model's output into poses:
+    scene_id, rollout_id   which scene and rollout the step came from (the train/val split key)
     traj_xy   (40, 2)  teacher poses at +0.1 ... +4.0 s after the request, expressed in the ego
                        frame at the request time (x forward, y left)
     valid     (40,)    False where the teacher pose for that time step is missing
@@ -42,7 +43,7 @@ from alpasim_utils.logs import async_read_pb_log
 from ..alpanet.alpanet_model import NUM_WAYPOINTS
 from ..alpanet.camera_utils import CAMERA_IDS
 
-LABEL_VERSION = 2
+LABEL_VERSION = 3
 _STEP_US = 100_000       # 10 Hz
 _TIME_TOL_US = 10_000    # tolerance when matching a pose to its target time
 _REF_TOL_M = 0.05        # driver_return pose 0 must coincide with the ego pose at the request
@@ -85,6 +86,7 @@ def _teacher_targets(
 async def _extract_rollout(asl_path: Path, out_dir: Path) -> tuple[int, dict[str, int]]:
     """Parse one .asl file and write samples to out_dir. Returns (sample count, skip counts)."""
     out_dir.mkdir(parents=True, exist_ok=True)
+    scene_id, rollout_id = asl_path.parent.parent.name, asl_path.parent.name
 
     records: list[dict] = []
     skips = {"no_images": 0, "missing_camera": 0, "ref_mismatch": 0, "no_targets": 0}
@@ -157,6 +159,8 @@ async def _extract_rollout(asl_path: Path, out_dir: Path) -> tuple[int, dict[str
                 str(img_file), **{cam: pending_images[cam] for cam in CAMERA_IDS}
             )
             records.append({
+                "scene_id":      scene_id,
+                "rollout_id":    rollout_id,
                 "timestamp_us":  t_req,
                 "traj_xy":       traj.tolist(),
                 "valid":         valid.tolist(),
