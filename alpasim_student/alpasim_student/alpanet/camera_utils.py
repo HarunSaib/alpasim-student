@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# Camera IDs used by AlpaNet (matches StudentNet / Alpamayo rig).
+# Camera IDs used by AlpaNet (the Alpamayo rig), in model input order.
 CAMERA_IDS = [
     "camera_cross_left_120fov",
     "camera_front_wide_120fov",

@@ -34,7 +34,7 @@ from .camera_utils import CAMERA_IDS, CameraParams
 # ── Constants ──────────────────────────────────────────────────────────────────
 IMG_H = 270
 IMG_W = 480
-NUM_WAYPOINTS = 40      # 10 Hz × 4.0 s — matches StudentNet
+NUM_WAYPOINTS = 40      # 10 Hz × 4.0 s
 N_HYPOTHESES  = 4
 STATE_DIM     = 2       # speed (m/s), acceleration (m/s²)
 N_CAM         = len(CAMERA_IDS)

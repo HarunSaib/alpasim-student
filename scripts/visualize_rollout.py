@@ -492,7 +492,7 @@ def visualize(rollout_dir: Path, save_path: Path | None = None,
         if ts in reasoning_by_ts:
             rr.log("reasoning", rr.TextLog(reasoning_by_ts[ts]))
 
-        # Planned trajectory (single plan for StudentNet, best hypothesis for AlpaNet)
+        # Planned trajectory (the executed hypothesis)
         if ts in plan_by_ts:
             raw    = plan_by_ts[ts]
             plan3d = [[x - origin[0], y - origin[1], z - origin[2]] for x, y, z in raw]

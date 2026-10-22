@@ -2,7 +2,7 @@
 
 DAgger imitation learning plugin for [NVlabs/alpasim](https://github.com/NVlabs/alpasim).
 
-Trains camera-based student models (StudentNet, AlpaNet) to imitate the Alpamayo 1.5 teacher in AlpaSim.
+Trains AlpaNet, a camera-based driving policy, to imitate the Alpamayo 1.5 teacher in AlpaSim.
 The simulator is credited to NVIDIA and pinned as a submodule; this repository contains only the plugin.
 
 ## Structure
@@ -12,10 +12,8 @@ alpasim_student/              ← deployable plugin (copied into <alpasim>/plugi
   pyproject.toml
   alpasim_student/
     paths.py                  ← finds the AlpaSim checkout (ALPASIM_ROOT, deployed location, or submodule)
-    dagger/                   ← DAgger loop, collector, StudentNet and AlpaNet trainers
+    dagger/                   ← DAgger loop, collector, dataset, AlpaNet trainer
     alpanet/                  ← AlpaNet: ResNet34 + BEV lifter + multi-hypothesis head
-    grpo/                     ← GRPO prototype (unfinished)
-    student_model.py          ← StudentNet driver plugin
     configs/driver/           ← driver configs for the simulator
 topology/2gpu_alpamayo.yaml   ← GPU placement: driver on GPU 0, renderer on GPU 1
 scripts/                      ← rollout visualizer (Rerun), BEV geometry check
@@ -53,7 +51,7 @@ count are reduced automatically.
 ```bash
 cd /home/harun/alpasim
 nohup uv run --extra all --no-sync python -m alpasim_student.dagger.loop \
-    --base-dir ./dagger_run_v2 --model alpanet \
+    --base-dir ./dagger_run_v2 \
     > /tmp/dagger_loop_v2.log 2>&1 &
 ```
 
@@ -71,7 +69,7 @@ Defaults: 20 iterations, 60 epochs, all 8 scenes with the curriculum expanding 2
 
 ```bash
 uv run --extra all --no-sync python -m alpasim_student.dagger.loop \
-    --base-dir ./dagger_run_v2 --model alpanet \
+    --base-dir ./dagger_run_v2 \
     --start-iteration 10 \
     --initial-checkpoint ./dagger_run_v2/checkpoints/alpanet_iter_10_best.pth
 ```

@@ -15,45 +15,55 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import ast
 import os
 from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 import wandb
 from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler, random_split
 
-from ..alpanet.alpanet_model import AlpaNet, IMG_H, IMG_W, N_HYPOTHESES, NUM_WAYPOINTS, winner_takes_all_loss
-from ..alpanet.camera_utils import CAMERA_IDS, load_cam_params
+from ..alpanet.alpanet_model import AlpaNet, N_HYPOTHESES, winner_takes_all_loss
+from ..alpanet.camera_utils import load_cam_params
 from ..paths import find_alpasim_root
-from .trainer import AlpaSimDataset, VAL_FRAC, _compute_traj_metrics, _traj_figure
-
-# AlpaNet-specific image transform (larger resize than StudentNet)
-import torchvision.transforms.v2 as T
-
-_TRANSFORM = T.Compose([
-    T.ToImage(),                                   # numpy HWC uint8 → CHW tensor uint8
-    T.Resize((IMG_H, IMG_W)),
-    T.ToDtype(torch.float32, scale=True),          # uint8 → float32 in [0, 1]
-    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-])
-
-
-class AlpaNetDataset(AlpaSimDataset):
-    """AlpaSimDataset variant that uses the AlpaNet image transform."""
-
-    def __init__(self, data_dir: Path, source_iter: int = 0):
-        super().__init__(data_dir, source_iter)
-        self.transform = _TRANSFORM
-
+from .dataset import VAL_FRAC, AlpaNetDataset
 
 _REPO_ROOT = find_alpasim_root()
+
+
+def _compute_traj_metrics(pred: torch.Tensor, gt: torch.Tensor) -> dict[str, float]:
+    """ADE, FDE, per-axis MAE and max lateral error for (B, T, 2) trajectories."""
+    diff = pred - gt
+    l2 = diff.norm(dim=-1)
+    return {
+        "ade":         l2.mean().item(),
+        "fde":         l2[:, -1].mean().item(),
+        "loss_x":      diff[..., 0].abs().mean().item(),
+        "loss_y":      diff[..., 1].abs().mean().item(),
+        "max_lat_err": diff[..., 1].abs().max().item(),
+    }
+
+
+def _traj_figure(pred: torch.Tensor, gt: torch.Tensor, n: int = 6) -> "plt.Figure":
+    """Plot predicted vs teacher trajectories for up to `n` samples."""
+    pred_np = pred[:n].detach().cpu().numpy()
+    gt_np = gt[:n].detach().cpu().numpy()
+
+    fig, axes = plt.subplots(1, n, figsize=(3 * n, 3), tight_layout=True)
+    if n == 1:
+        axes = [axes]
+    for i, ax in enumerate(axes):
+        ax.plot(gt_np[i, :, 0],   gt_np[i, :, 1],   "g.-", label="teacher", linewidth=1.5)
+        ax.plot(pred_np[i, :, 0], pred_np[i, :, 1], "r.-", label="student", linewidth=1.5)
+        ax.set_xlabel("x (m)")
+        ax.set_ylabel("y (m)")
+        ax.set_title(f"Sample {i}")
+        ax.legend(fontsize=7)
+        ax.set_aspect("equal")
+    return fig
 
 
 def train(
@@ -81,7 +91,7 @@ def train(
     # ------------------------------------------------------------------ #
     # Dataset                                                              #
     # ------------------------------------------------------------------ #
-    datasets = [AlpaNetDataset(d, source_iter=i) for i, d in enumerate(data_dirs)]
+    datasets = [AlpaNetDataset(d) for d in data_dirs]
     full_dataset = ConcatDataset(datasets)
     n_total = len(full_dataset)
     n_val   = max(1, int(n_total * VAL_FRAC)) if n_total > 1 else 0
@@ -183,7 +193,7 @@ def train(
         }
         last_pred, last_gt = None, None
 
-        for images, state, traj_gt, *_ in train_loader:
+        for images, state, traj_gt in train_loader:
             images  = images.to(device)
             state   = state.to(device)
             traj_gt = traj_gt.to(device)
@@ -221,7 +231,7 @@ def train(
         val_pred_buf, val_gt_buf = None, None
 
         with torch.no_grad():
-            for images, state, traj_gt, *_ in val_loader:
+            for images, state, traj_gt in val_loader:
                 images  = images.to(device)
                 state   = state.to(device)
                 traj_gt = traj_gt.to(device)

@@ -18,7 +18,7 @@ echo "[sync] Simulator pin: $(git ls-tree HEAD third_party/alpasim | awk '{print
 
 echo "[sync] Deploying plugin into $ALPASIM_ROOT/plugins/alpasim_student ..."
 mkdir -p "$ALPASIM_ROOT/plugins/alpasim_student"
-rsync -a --delete --exclude __pycache__ \
+rsync -a --delete --delete-excluded --exclude __pycache__ \
   "$STUDENT_REPO/alpasim_student/" "$ALPASIM_ROOT/plugins/alpasim_student/"
 
 echo "[sync] Copying topology config..."
