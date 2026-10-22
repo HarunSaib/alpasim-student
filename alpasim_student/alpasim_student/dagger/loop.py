@@ -18,7 +18,9 @@ from pathlib import Path
 
 import pandas as pd
 
-ALPASIM_ROOT = Path(__file__).resolve().parents[4]  # ~/alpasim
+from ..paths import find_alpasim_root
+
+ALPASIM_ROOT = find_alpasim_root()
 
 
 def _load_env() -> None:
@@ -38,20 +40,20 @@ def _load_env() -> None:
             print(f"[env] Loaded {key} from .env")
 
 
-def _run_wizard(
+def _generate_compose(
     driver: str,
     log_dir: Path,
     topology: str = "2gpu_alpamayo",
     base_dir: Path | None = None,
     scene_ids: list[str] | None = None,
-) -> None:
-    """Launch alpasim_wizard, patch docker-compose for the student plugin, then run it.
+) -> Path:
+    """Generate and patch the wizard's docker-compose.yaml; return its path.
 
     Steps:
         1. Run wizard with run_method=NONE to generate configs only (no containers).
         2. Patch docker-compose.yaml: add ``--extra all`` to every ``uv run -m alpasim_driver``
            command so the student plugin entry-point is visible inside the container.
-        3. Run ``docker compose up`` manually to start services.
+        GPU placement is taken as generated from the topology YAML, not rewritten here.
     """
     import re
 
@@ -171,13 +173,6 @@ def _run_wizard(
             patched = new_patched
             print(f"[loop] Patched {compose_file}: added student install to driver-0 service")
 
-        # Move all GPU-1 services to GPU-0 — GPU 1 may be occupied by other
-        # processes leaving insufficient VRAM for the sensor simulator.
-        patched = patched.replace(
-            "              device_ids:\n                - '1'",
-            "              device_ids:\n                - '0'",
-        )
-
         # Reduce fragmentation-induced OOM during sensor rendering.
         patched = patched.replace(
             "    environment:\n      - OMP_NUM_THREADS=1",
@@ -188,14 +183,79 @@ def _run_wizard(
             "    environment:\n      - WARP_CACHE_PATH='/mnt/warp'\n      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
         )
 
-        # Reduce sensorsim GPU memory: fewer cached scenes and render workers.
-        patched = patched.replace("--cache-size=5 --max-workers=4", "--cache-size=2 --max-workers=2")
+        # Shrink the renderer only when it shares a GPU with the driver.
+        placement = _gpu_placement(patched)
+        if set(placement.get("driver-0", [])) & set(placement.get("sensorsim-0", [])):
+            patched = patched.replace("--cache-size=5 --max-workers=4", "--cache-size=2 --max-workers=2")
 
         if patched != original:
             compose_file.write_text(patched)
             print(f"[loop] Patched {compose_file}: added --extra all + student install")
 
-    # ── Step 3: run docker compose ────────────────────────────────────────────
+    return compose_file
+
+
+def _gpu_placement(compose_text: str) -> dict[str, list[str]]:
+    """Map each compose service to the GPU ids it reserves."""
+    import re
+
+    placement: dict[str, list[str]] = {}
+    service: str | None = None
+    in_ids = False
+    for line in compose_text.splitlines():
+        header = re.match(r"^  ([A-Za-z0-9_\-]+):\s*$", line)
+        if header:
+            service, in_ids = header.group(1), False
+        elif "device_ids:" in line:
+            in_ids = True
+        elif in_ids:
+            item = re.match(r"^\s+- '?(\d+)'?\s*$", line)
+            if item and service:
+                placement.setdefault(service, []).append(item.group(1))
+            else:
+                in_ids = False
+    return placement
+
+
+def _check_gpus_free(gpu_ids: set[str], max_used_mib: int = 2048) -> None:
+    """Fail fast if a GPU the topology needs is already in use by another process."""
+    if os.environ.get("ALPASIM_SKIP_GPU_CHECK") == "1":
+        return
+    out = subprocess.run(
+        ["nvidia-smi", "--query-gpu=index,memory.used,memory.total",
+         "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    busy = []
+    for line in out.strip().splitlines():
+        idx, used, total = (field.strip() for field in line.split(","))
+        if idx in gpu_ids and int(used) > max_used_mib:
+            busy.append(f"GPU {idx}: {used}/{total} MiB in use")
+    if busy:
+        raise RuntimeError(
+            "GPUs required by the topology are not free: " + "; ".join(busy)
+            + ". Free them, or set ALPASIM_SKIP_GPU_CHECK=1 to override."
+        )
+
+
+def _run_wizard(
+    driver: str,
+    log_dir: Path,
+    topology: str = "2gpu_alpamayo",
+    base_dir: Path | None = None,
+    scene_ids: list[str] | None = None,
+) -> None:
+    """Generate the compose file, check the GPUs it needs are free, then run it."""
+    log_dir = Path(log_dir).resolve()
+    env = {**os.environ, "UV_LINK_MODE": "copy"}
+    compose_file = _generate_compose(driver, log_dir, topology, base_dir, scene_ids)
+
+    placement = _gpu_placement(compose_file.read_text())
+    print("[loop] GPU placement: " + ", ".join(
+        f"{svc}->{'+'.join(ids)}" for svc, ids in sorted(placement.items())
+    ))
+    _check_gpus_free({g for ids in placement.values() for g in ids})
+
     run_cmd = ["docker", "compose", "-f", str(compose_file), "up"]
     print(f"[loop] $ {' '.join(run_cmd)}")
     try:
@@ -322,8 +382,6 @@ ALL_SCENE_IDS = [
     "clipgt-e36cf4c2-03a0-4af2-9146-48a5372efb3d",   # Batch0007 — unseen batch
     "clipgt-19f339ba-4f3a-4025-b774-4b271e639f2a",   # Batch0009 — unseen batch
 ]
-
-DEFAULT_SCENE_IDS = ALL_SCENE_IDS[:3]
 
 # Curriculum: scene list expands as the model matures.
 # Iters 0-5:  2 scenes (core lane-keeping + turning)
@@ -592,7 +650,7 @@ if __name__ == "__main__":
         epochs_per_iter     = args.epochs,
         start_iteration     = args.start_iteration,
         initial_checkpoint  = Path(args.initial_checkpoint) if args.initial_checkpoint else None,
-        scene_ids           = args.scenes or DEFAULT_SCENE_IDS,
-        teacher_scene_ids   = DEFAULT_SCENE_IDS[:2],
+        scene_ids           = args.scenes or ALL_SCENE_IDS,
+        teacher_scene_ids   = ALL_SCENE_IDS[:2],
         model               = args.model,
     )

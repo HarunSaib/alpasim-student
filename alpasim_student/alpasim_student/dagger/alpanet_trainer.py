@@ -31,6 +31,7 @@ from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler, r
 
 from ..alpanet.alpanet_model import AlpaNet, IMG_H, IMG_W, N_HYPOTHESES, NUM_WAYPOINTS, winner_takes_all_loss
 from ..alpanet.camera_utils import CAMERA_IDS, load_cam_params
+from ..paths import find_alpasim_root
 from .trainer import AlpaSimDataset, VAL_FRAC, _compute_traj_metrics, _traj_figure
 
 # AlpaNet-specific image transform (larger resize than StudentNet)
@@ -52,7 +53,7 @@ class AlpaNetDataset(AlpaSimDataset):
         self.transform = _TRANSFORM
 
 
-_REPO_ROOT = Path(__file__).resolve().parents[4]  # ~/alpasim
+_REPO_ROOT = find_alpasim_root()
 
 
 def train(
